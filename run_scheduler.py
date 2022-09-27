@@ -1,4 +1,4 @@
-import copy, pprint
+import copy, pprint, traceback
 
 LINE_SEP = "#" * 42
 
@@ -91,12 +91,14 @@ def experiment_scheduler(run_params, dataset_getter, model_getter, train_func,
 
     global data_dict
     all_results = []
+    all_models = []
 
     def _single_run():
         print("Loading dataset!")
         data_dict = dataset_getter(params)
         # Make a new model
         model_dict = model_getter(params, data_dict)
+        all_models.append(model_dict)
         results = train_func(model_dict, data_dict, params)
         all_results.append(results)
         if logger_func:
@@ -127,4 +129,4 @@ def experiment_scheduler(run_params, dataset_getter, model_getter, train_func,
                 all_results.append(None)
                 print("Run errored out due to some the following reason:")
                 traceback.print_exc()
-    return all_results
+    return all_results, all_models
