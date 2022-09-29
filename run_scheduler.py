@@ -1,4 +1,5 @@
-import copy, pprint, traceback
+import copy, traceback
+from pprint import pprint
 
 LINE_SEP = "#" * 42
 
