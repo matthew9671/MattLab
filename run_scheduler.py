@@ -1,5 +1,6 @@
 import copy, traceback
 from pprint import pprint
+import wandb
 
 LINE_SEP = "#" * 42
 
@@ -59,7 +60,9 @@ def dict_update(d, u):
 # A standardized function that structures and schedules experiments
 # Can chain multiple variations of experiment parameters together
 def experiment_scheduler(run_params, dataset_getter, model_getter, train_func, 
-                         logger_func=None, err_logger_func=None, run_variations=None):
+                         logger_func=None, err_logger_func=None, 
+                         run_variations=None, 
+                         continue_on_error=True, use_wandb=True):
     """
     Arguments:
         run_params: dict{"dataset_params"} 
@@ -120,7 +123,7 @@ def experiment_scheduler(run_params, dataset_getter, model_getter, train_func,
             params = dict_update(params, curr_variation)
             if curr_variation.get("dataset_params"):
                 reload_data = True
-        if (num_runs == 1):
+        if not continue_on_error:
             _single_run()
         else:
             try:
@@ -130,4 +133,5 @@ def experiment_scheduler(run_params, dataset_getter, model_getter, train_func,
                 all_results.append(None)
                 print("Run errored out due to some the following reason:")
                 traceback.print_exc()
+            if use_wandb: wandb.finish()
     return all_results, all_models
