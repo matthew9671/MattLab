@@ -3167,7 +3167,7 @@ def expand_pendulum_parameters(params):
     # Not a very good validation split (mostly because we're doing one full batch for val)
     val_trials = { "small": 4, "medium": 20, "large": 200 }
     noise_scales = { "small": 1., "medium": .1, "large": .01 }
-    max_iters = 20000
+    max_iters = 30000
 
     # Modify all the architectures according to the parameters given
     D, H = params["latent_dims"], params["rnn_dims"]
@@ -3242,53 +3242,25 @@ def expand_pendulum_parameters(params):
     extended_params.update(params)
     return extended_params
 
-# @title Pendulum run params
-run_params = {
-    # Most important: inference method
-    "inference_method": "svae",
-    # Relevant dimensions
-    "latent_dims": 2,
-    "rnn_dims": 10,
-    "seed": jr.PRNGKey(0),
-    "dataset_size": "medium", # "small", "medium", "large"
-    "snr": "medium", # "small", "medium", "large"
-    "use_natural_grad": False,
-    "constrain_prior": False,
-    "base_lr": 1e-2,
-    "prior_base_lr": 1e-2,
-    "prior_lr_warmup": True,
-    "lr_decay": False,
-    "group_tag": "test_prediction",
-    # The only pendulum-specific entry, will be overridden by params expander
-    "mask_size": 40,
-    # "plot_interval": 1,
-    "mask_start": 0,#1000
-}
+def run_lds(run_params, run_variations=None):
+    results = experiment_scheduler(run_params, 
+                     run_variations=run_variations,
+                     dataset_getter=sample_lds_dataset, 
+                     model_getter=init_model, 
+                     train_func=start_trainer,
+                     params_expander=expand_lds_parameters,
+                     on_error=on_error)
+    wandb.finish()
+    return results
 
-# methods = {
-#     # "inference_method": ["svae", "cdkf", "planet", "dkf"],
-#     # "mask_start": [0, 2000, 2000, 2000]
-#     "inference_method": ["planet", "svae"],
-#     "mask_start": [2000, 0],
-#     "use_natural_grad": [False, False],
-#     "constrain_prior": [True, True]
-# }
 
-seeds = {
-    "seed": [jr.PRNGKey(i) for i in range(3)]
-}
-
-run_variations = seeds#dict_product(seeds, methods)
-
-# @title Run the pendulum experiments
-# jax.config.update("jax_debug_nans", True)
-# jax.config.update("jax_enable_x64", True)
-
-# results = experiment_scheduler(run_params, 
-#                      run_variations=run_variations,
-#                      dataset_getter=load_pendulum, 
-#                      model_getter=init_model, 
-#                      train_func=start_trainer,
-#                      params_expander=expand_pendulum_parameters,
-#                      on_error=on_error,
-#                      continue_on_error=True)
+def run_pendulum(run_params, run_variations=None):
+    results = experiment_scheduler(run_params, 
+                     run_variations=run_variations,
+                     dataset_getter=load_pendulum, 
+                     model_getter=init_model, 
+                     train_func=start_trainer,
+                     params_expander=expand_pendulum_parameters,
+                     on_error=on_error)
+    wandb.finish()
+    return results
