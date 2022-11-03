@@ -3,7 +3,7 @@ import os
 import sys
 
 import jax.random as jr
-from svae_main import dict_product, run_pendulum
+from revisiting_svae import dict_product, run_pendulum
 
 if __name__ == '__main__':
     
@@ -53,8 +53,8 @@ if __name__ == '__main__':
     #     # "plot_interval": 1,
     #     "mask_start": 0,#1000
     # }
-
-    run_params = vars(parser)
+    args = parser.parse_args()
+    run_params = vars(args)
     run_params["seed"] = jr.PRNGKey(run_params["seed"])
 
     run_pendulum(run_params)

@@ -3134,7 +3134,7 @@ def expand_lds_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-LDS-Final",
+        "project_name": "SVAE-LDS-ICML",
         "log_to_wandb": True,
         "dataset": "lds",
         "dataset_params": {
@@ -3212,7 +3212,7 @@ def expand_pendulum_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-Pendulum-Final",
+        "project_name": "SVAE-Pendulum-ICML",
         "log_to_wandb": True,
         "dataset": "pendulum",
         # Must be model learning
