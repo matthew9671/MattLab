@@ -2064,7 +2064,8 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
 
     itr = len(trainer.train_losses) - 1
     if len(trainer.train_losses) == 1:
-        wandb.init(project=project_name, group=group_name, config=p)
+        wandb.init(project=project_name, group=group_name, config=p,
+            settings=wandb.Settings(start_method='fork'))
 
     obj, aux = loss_out
     elbo = -obj
