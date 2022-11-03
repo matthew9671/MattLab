@@ -1789,7 +1789,6 @@ def get_marginals_and_targets(seed, data, num_points, model,
 
 """## Define training loop"""
 
-# @title Trainer object 
 class Trainer:
     """
     model: a pytree node
@@ -1849,7 +1848,10 @@ class Trainer:
         And logs to WandB
     """
     def train(self, data_dict, max_iters, 
-              callback=None, val_callback=None, summary=None, key=None):
+              callback=None, val_callback=None, 
+              summary=None, key=None,
+              early_stop_start=5000, 
+              max_lose_streak=100):
 
         if key is None:
             key = jr.PRNGKey(0)
@@ -1862,7 +1864,7 @@ class Trainer:
         init_key, key = jr.split(key, 2)
 
         # Initialize optimizer
-        self.params, self.opts, opt_states = self.init(init_key, model, 
+        self.params, self.opts, self.opt_states = self.init(init_key, model, 
                                                        train_data[:batch_size], 
                                                        self.params,
                                                        **self.train_params)
@@ -1882,15 +1884,19 @@ class Trainer:
         train_step = jit(self.train_step)
         val_step = jit(self.val_step)
 
+        best_loss = None
+        best_itr = 0
+        val_loss = None
+
         for itr in pbar:
             train_key, val_key, key = jr.split(key, 3)
 
             batch_id = itr % num_batches
             batch_start = batch_id * batch_size
 
-            self.params, opt_states, loss_out, grads = \
+            self.params, self.opt_states, loss_out, grads = \
                 train_step(train_key, self.params, 
-                           train_data[batch_start:batch_start+batch_size], opt_states)
+                           train_data[batch_start:batch_start+batch_size], self.opt_states)
 
             loss, aux = loss_out
             self.train_losses.append(loss)
@@ -1903,6 +1909,20 @@ class Trainer:
                 if (self.train_params.get("use_validation")):
                     val_loss_out = val_step(val_key, self.params, data_dict["val_data"])
                     if (val_callback): val_callback(self, val_loss_out, data_dict)
+                    val_loss, _ = val_loss_out
+                    
+            if not self.train_params.get("use_validation") or val_loss is None:
+                curr_loss = loss
+            else:
+                curr_loss = val_loss
+
+            if itr >= early_stop_start:
+                if best_loss is None or curr_loss < best_loss:
+                    best_itr = itr
+                    best_loss = curr_loss
+                if curr_loss > best_loss and itr - best_itr > max_lose_streak:
+                    print("Early stopping!")
+                    break
 
             if (callback): callback(self, loss_out, data_dict, grads)
 
@@ -2087,9 +2107,15 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
         prior_img = wandb.Image(img, caption="Prior Sample")
         plt.close()
         visualizations["Prior sample"] = prior_img
-        
-    to_log = {"ELBO": elbo, "KL": kl, "Likelihood": ell, #"Prior graident norm": prior_grads_norm,
-                "Condition number of A": A_cond_num, "Condition number of Q": Q_cond_num}
+    # Also log the learning rates
+    lr = p["learning_rate"] 
+    lr = lr if isinstance(lr, float) else lr(itr)
+    prior_lr = p["prior_learning_rate"] 
+    prior_lr = prior_lr if isinstance(prior_lr, float) else prior_lr(itr)
+
+    to_log = { "ELBO": elbo, "KL": kl, "Likelihood": ell, #"Prior graident norm": prior_grads_norm,
+               "Condition number of A": A_cond_num, "Condition number of Q": Q_cond_num,
+               "Learning rate": lr, "Prior learning rate": prior_lr }
     to_log.update(visualizations)
     wandb.log(to_log)
 
