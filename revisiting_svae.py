@@ -1851,7 +1851,7 @@ class Trainer:
               callback=None, val_callback=None, 
               summary=None, key=None,
               early_stop_start=5000, 
-              max_lose_streak=100):
+              max_lose_streak=200):
 
         if key is None:
             key = jr.PRNGKey(0)
@@ -2066,6 +2066,7 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
     if len(trainer.train_losses) == 1:
         wandb.init(project=project_name, group=group_name, config=p,
             settings=wandb.Settings(start_method='fork'))
+        pprint(p)
 
     obj, aux = loss_out
     elbo = -obj
@@ -3244,6 +3245,7 @@ def expand_pendulum_parameters(params):
     return extended_params
 
 def run_lds(run_params, run_variations=None):
+    jax.config.update("jax_debug_nans", True)
     results = experiment_scheduler(run_params, 
                      run_variations=run_variations,
                      dataset_getter=sample_lds_dataset, 
@@ -3256,6 +3258,7 @@ def run_lds(run_params, run_variations=None):
 
 
 def run_pendulum(run_params, run_variations=None):
+    jax.config.update("jax_debug_nans", True)
     results = experiment_scheduler(run_params, 
                      run_variations=run_variations,
                      dataset_getter=load_pendulum, 
