@@ -1,9 +1,3 @@
-# @title Download stuff 
-import os
-# Download and install the relevant libraries
-!pip install -q ml-collections git+https://github.com/google/flax
-!pip install -q wandb
-
 """# Set up everything"""
 
 # @title Imports
