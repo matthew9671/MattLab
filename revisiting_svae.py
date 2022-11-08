@@ -1,5 +1,8 @@
 # @title Download stuff 
 import os
+# Download and install the relevant libraries
+!pip install -q ml-collections git+https://github.com/google/flax
+!pip install -q wandb
 
 """# Set up everything"""
 
@@ -55,7 +58,7 @@ from PIL import ImageDraw
 
 # For making nice visualizations
 from sklearn.decomposition import PCA
-# from IPython.display import clear_output, HTML # We're not in an interactive environment
+# from IPython.display import clear_output, HTML
 from matplotlib import animation, rc
 import seaborn as sns
 color_names = ["windows blue",
@@ -142,6 +145,34 @@ def lie_params_to_constrained(out_flat, dim, eps=1e-4):
     O = scipy.linalg.expm(S)
     J = O.T @ np.diag(D) @ O
     return J
+
+# converts an (n, n) matrix 
+# to an (n, n) matrix with singular values in (0, 1)
+def get_constrained_dynamics(A):
+    dim = A.shape[0]
+    diag = np.diag(A)
+    diag = sigmoid(diag)
+    # Build a skew-symmetric matrix
+    S = np.zeros((dim, dim))
+    i1, i2 = np.tril_indices(dim - 1)
+    S = S.at[i1+1, i2].set(A[i1+1, i2])
+    S = S.T
+    S = S.at[i1+1, i2].set(-A[i1+1, i2])
+    U = scipy.linalg.expm(S)
+
+    S = np.zeros((dim, dim))
+    i1, i2 = np.tril_indices(dim - 1)
+    S = S.at[i1+1, i2].set(A.T[i1+1, i2])
+    S = S.T
+    S = S.at[i1+1, i2].set(-A.T[i1+1, i2])
+    V = scipy.linalg.expm(S)
+
+    A = U @ np.diag(diag) @ V
+    return A, U, V
+
+def scale_singular_values(A):
+    _, s, _ = svd(A)
+    return A / (np.maximum(1, np.max(s)))
 
 # Assume that h has a batch shape here
 def sample_info_gaussian(seed, J, h):
@@ -1789,6 +1820,7 @@ def get_marginals_and_targets(seed, data, num_points, model,
 
 """## Define training loop"""
 
+# @title Trainer object 
 class Trainer:
     """
     model: a pytree node
@@ -1851,7 +1883,7 @@ class Trainer:
               callback=None, val_callback=None, 
               summary=None, key=None,
               early_stop_start=5000, 
-              max_lose_streak=200):
+              max_lose_streak=1000):
 
         if key is None:
             key = jr.PRNGKey(0)
@@ -2047,7 +2079,7 @@ def validation_log_to_wandb(trainer, loss_out, data_dict):
         pred_ll = np.mean(aux["prediction_ll"])
         visualizations = {
             "Validation reconstruction": visualizations["Reconstruction"], 
-            "Validation posterior Sample": visualizations["Posterior Sample"],
+            "Validation posterior sample": visualizations["Posterior Sample"],
             "Validation prediction log likelihood": pred_ll
         }
         
@@ -2064,8 +2096,7 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
 
     itr = len(trainer.train_losses) - 1
     if len(trainer.train_losses) == 1:
-        wandb.init(project=project_name, group=group_name, config=p,
-            settings=wandb.Settings(start_method='fork'))
+        wandb.init(project=project_name, group=group_name, config=p)
         pprint(p)
 
     obj, aux = loss_out
@@ -2087,7 +2118,8 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
     eigs = eigh(Q)[0]
     Q_cond_num = np.max(eigs) / np.min(eigs)
     svs = svd(A)[1]
-    A_cond_num = np.max(svs) / np.min(svs)
+    max_sv, min_sv = np.max(svs), np.min(svs)
+    A_cond_num = max_sv / min_sv
 
     # Also log the prior params gradients
     # prior_grads = grads["prior_params"]["sgd_params"]
@@ -2115,7 +2147,8 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
     prior_lr = p["prior_learning_rate"] 
     prior_lr = prior_lr if isinstance(prior_lr, float) else prior_lr(itr)
 
-    to_log = { "ELBO": elbo, "KL": kl, "Likelihood": ell, #"Prior graident norm": prior_grads_norm,
+    to_log = { "ELBO": elbo, "KL": kl, "Likelihood": ell, # "Prior graident norm": prior_grads_norm,
+               "Max singular value of A": max_sv, "Min singular value of A": min_sv,
                "Condition number of A": A_cond_num, "Condition number of Q": Q_cond_num,
                "Learning rate": lr, "Prior learning rate": prior_lr }
     to_log.update(visualizations)
@@ -2244,6 +2277,10 @@ def svae_update(params, grads, opts, opt_states, model, aux, **train_params):
             # Revert Q and b to their previous values
             params["prior_params"]["Q"] = old_Q
             params["prior_params"]["b"] = old_b
+
+        if (train_params.get("constrain_dynamics")):
+            # Scale A so that its maximum singular value does not exceed 1
+            params["prior_params"]["A"] = scale_singular_values(params["prior_params"]["A"])
 
     return params, (rec_opt_state, dec_opt_state, prior_opt_state)
 
@@ -3072,7 +3109,9 @@ def get_lr(params, max_iters):
     prior_base_lr = params["prior_base_lr"]
     lr = base_lr
     prior_lr = prior_base_lr
+    pprint(params)
     if params["lr_decay"]:
+        print("Using learning rate decay!")
         lr = opt.exponential_decay(init_value=base_lr, 
                                      transition_steps=max_iters,
                                      decay_rate=0.99, 
@@ -3136,7 +3175,7 @@ def expand_lds_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-LDS-ICML",
+        "project_name": "SVAE-LDS-ICML-1",
         "log_to_wandb": True,
         "dataset": "lds",
         "dataset_params": {
@@ -3214,7 +3253,7 @@ def expand_pendulum_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-Pendulum-ICML",
+        "project_name": "SVAE-Pendulum-ICML-1",
         "log_to_wandb": True,
         "dataset": "pendulum",
         # Must be model learning
@@ -3237,7 +3276,8 @@ def expand_pendulum_parameters(params):
         "mask_type": "potential" if params["inference_method"] == "svae" else "data",
         "learning_rate": lr, 
         "prior_learning_rate": prior_lr,
-        "use_validation": True
+        "use_validation": True,
+        "constrain_dynamics": True
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
@@ -3255,7 +3295,6 @@ def run_lds(run_params, run_variations=None):
                      on_error=on_error)
     wandb.finish()
     return results
-
 
 def run_pendulum(run_params, run_variations=None):
     jax.config.update("jax_debug_nans", True)
