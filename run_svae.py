@@ -25,6 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample_kl', type=int)
     parser.add_argument('--use_natural_grad', type=int)
     parser.add_argument('--constrain_prior', type=int)
+    parser.add_argument('--constrain_dynamics', type=int)
 
     parser.add_argument('--lr_decay', type=int)
     parser.add_argument('--prior_lr_warmup', type=int)

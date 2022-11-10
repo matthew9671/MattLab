@@ -374,6 +374,7 @@ def experiment_scheduler(run_params, dataset_getter, model_getter, train_func,
         else:
             try:
                 _single_run(data_out, model_out)
+                if use_wandb: wandb.finish()
             except:
                 all_results.append(None)
                 if (on_error): 
@@ -383,7 +384,7 @@ def experiment_scheduler(run_params, dataset_getter, model_getter, train_func,
                         pass # Oh well...
                 print("Run errored out due to some the following reason:")
                 traceback.print_exc()
-            if use_wandb: wandb.finish()
+                if use_wandb: wandb.finish(exit_code=1)
     return all_results, all_models
 
 """## Define the base SVAE object"""
@@ -957,6 +958,9 @@ class LinearGaussianChain(SVAEPrior):
                                     "ExnxT": constrained["ExnxT"] }
         return params
 
+    def get_dynamics_params(self, params):
+        return params
+
     def get_constrained_params(self, params):
         p = dynamics_to_tridiag(params, self.seq_len, self.latent_dims)
         J, L, h = p["J"], p["L"], p["h"]
@@ -1009,15 +1013,18 @@ class LieParameterizedLinearGaussianChain(LinearGaussianChain):
         }
         return params
 
-    def get_constrained_params(self, params):
-        D = self.latent_dims
-        p = {
+    def get_dynamics_params(self, params):
+        return {
             "m1": params["m1"],
             "Q1": lie_params_to_constrained(params["Q1"], self.latent_dims),
             "A": params["A"],
             "b": params["b"],
             "Q": lie_params_to_constrained(params["Q"], self.latent_dims)   
         }
+
+    def get_constrained_params(self, params):
+        D = self.latent_dims
+        p = self.get_dynamics_params(params)
         return super().get_constrained_params(p)
 
 # @title Linear Gaussian chain posteriors
@@ -1876,7 +1883,7 @@ class Trainer:
     def train(self, data_dict, max_iters, 
               callback=None, val_callback=None, 
               summary=None, key=None,
-              early_stop_start=5000, 
+              early_stop_start=20000, 
               max_lose_streak=1000):
 
         if key is None:
@@ -2090,7 +2097,8 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
 
     itr = len(trainer.train_losses) - 1
     if len(trainer.train_losses) == 1:
-        wandb.init(project=project_name, group=group_name, config=p)
+        wandb.init(project=project_name, group=group_name, config=p,
+        	dir="/scratch/users/yixiuz/")
         pprint(p)
 
     obj, aux = loss_out
@@ -2220,20 +2228,43 @@ def predict_forward(x, A, b, T):
 
 def svae_val_loss(key, model, data_batch, model_params, **train_params):
     
-    T = data_batch.shape[1]
-    
+    N, T = data_batch.shape[:2]
+    D = model.prior.latent_dims
+
     obs_data, pred_data = data_batch[:,:T//2], data_batch[:,T//2:]
     obj, out_dict = svae_loss(key, model, obs_data, model_params, **train_params)
     # Compute the prediction accuracy
     prior_params = model_params["prior_params"] 
-    def _prediction_lls(post_params, data):
+    # Instead of this, we want to evaluate the expected log likelihood of the future observations
+    # under the posterior given the current set of observations
+    # So E_{q(x'|y)}[p(y'|x')] where the primes represent the future
+
+    post_params = out_dict["posterior_params"]
+    def _prediction_lls(post_params, data, key):
         posterior = model.posterior.distribution(post_params)
-        x_pred = predict_forward(posterior.mean()[-1], 
-                                 prior_params["A"], prior_params["b"], T)
+        # Get the final mean and covariance
+        mu, Sigma = posterior.mean()[-1], posterior.covariance()[-1]
+        # Build the posterior object on the future latent states 
+        # ("the posterior predictive distribution")
+        # Convert unconstrained params to constrained dynamics parameters
+        prior_params_constrained = model.prior.get_dynamics_params(prior_params)
+        dynamics_params = {
+            "m1": mu,
+            "Q1": Sigma,
+            "A": prior_params_constrained["A"],
+            "b": prior_params_constrained["b"],
+            "Q": prior_params_constrained["Q"]
+        }
+        tridiag_params = dynamics_to_tridiag(dynamics_params, T+1, D) # Note the +1
+        J, L, h = tridiag_params["J"], tridiag_params["L"], tridiag_params["h"]
+        pred_posterior = MultivariateNormalBlockTridiag.infer(J, L, h)
+        # Sample from it and evaluate the log likelihood
+        x_pred = pred_posterior.sample(seed=key)[1:]
         likelihood_dist = model.decoder.apply(model_params["dec_params"], x_pred)
         return likelihood_dist.log_prob(data)
 
-    pred_lls = vmap(_prediction_lls)(out_dict["posterior_params"], data_batch)
+    pred_lls = vmap(_prediction_lls)(
+        out_dict["posterior_params"], data_batch, jr.split(key, N))
     out_dict["prediction_ll"] = pred_lls
     return obj, out_dict
 
@@ -2280,8 +2311,8 @@ def svae_update(params, grads, opts, opt_states, model, aux, **train_params):
 
 # @title Model initialization and trainer
 def init_model(run_params, data_dict):
-    p = run_params
-    d = run_params["dataset_params"]
+    p = deepcopy(run_params)
+    d = p["dataset_params"]
     latent_dims = p["latent_dims"]
     input_shape = data_dict["train_data"].shape[1:]
     num_timesteps = input_shape[0]
@@ -2296,13 +2327,13 @@ def init_model(run_params, data_dict):
     if p["inference_method"] in ["cdkf", "dkf"]:
         posterior = DKFPosterior(latent_dims, num_timesteps)
     elif p["inference_method"] == "planet":
-        posterior = PlaNetPosterior(run_params["posterior_architecture"],
+        posterior = PlaNetPosterior(p["posterior_architecture"],
                                     latent_dims, num_timesteps)
     elif p["inference_method"] == "svae":
         posterior = LDSSVAEPosterior(latent_dims, num_timesteps)
         
-    rec_net = recnet_class.from_params(**run_params["recnet_architecture"])
-    dec_net = decnet_class.from_params(**run_params["decnet_architecture"])
+    rec_net = recnet_class.from_params(**p["recnet_architecture"])
+    dec_net = decnet_class.from_params(**p["decnet_architecture"])
     if p["inference_method"] == "planet":
         # Wrap the recognition network
         rec_net = PlaNetRecognitionWrapper(rec_net)
@@ -3247,7 +3278,7 @@ def expand_pendulum_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-Pendulum-ICML-1",
+        "project_name": "SVAE-Pendulum-ICML-2",
         "log_to_wandb": True,
         "dataset": "pendulum",
         # Must be model learning
