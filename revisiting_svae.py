@@ -734,6 +734,16 @@ class MultivariateNormalBlockTridiag(tfd.Distribution):
         return self._filtered_linear_potentials
 
     @property
+    def filtered_covariances(self):
+        return inv(self._filtered_precisions)
+
+    @property
+    def filtered_means(self):
+        # TODO: this is bad numerically
+        return np.einsum("...ij,...j->...i", self.filtered_covariances, 
+                         self.filtered_linear_potentials)
+
+    @property
     def expected_states(self):
         return self._expected_states
 
@@ -2222,49 +2232,65 @@ def svae_loss(key, model, data_batch, model_params, **train_params):
 
 def predict_forward(x, A, b, T):
     def _step(carry, t):
-        carry = A @ x + b
+        carry = A @ carry + b
         return carry, carry
     return scan(_step, x, np.arange(T))[1]
 
-def svae_val_loss(key, model, data_batch, model_params, **train_params):
-    
+# Note: this is for pendulum data only
+def svae_val_loss(key, model, data_batch, model_params, **train_params):  
     N, T = data_batch.shape[:2]
+    # We only care about the first 100 timesteps
+    T = T // 2
     D = model.prior.latent_dims
 
-    obs_data, pred_data = data_batch[:,:T//2], data_batch[:,T//2:]
+    # obs_data, pred_data = data_batch[:,:T//2], data_batch[:,T//2:]
+    obs_data = data_batch[:,:T]
     obj, out_dict = svae_loss(key, model, obs_data, model_params, **train_params)
     # Compute the prediction accuracy
     prior_params = model_params["prior_params"] 
     # Instead of this, we want to evaluate the expected log likelihood of the future observations
     # under the posterior given the current set of observations
     # So E_{q(x'|y)}[p(y'|x')] where the primes represent the future
-
     post_params = out_dict["posterior_params"]
-    def _prediction_lls(post_params, data, key):
-        posterior = model.posterior.distribution(post_params)
-        # Get the final mean and covariance
-        mu, Sigma = posterior.mean()[-1], posterior.covariance()[-1]
+
+    posterior = model.posterior.distribution(post_params)
+    # J = posterior.filtered_precisions
+    # h = posterior.filtered_linear_potentials
+    Sigma_filtered = posterior.filtered_covariances # inv(J)
+    mu_filtered = posterior.filtered_means # np.einsum("...ij,...j->...i", Sigma_filtered, h)
+    horizon = train_params["prediction_horizon"] or 5
+
+    def _prediction_lls(data_id, key):
+        num_windows = T-horizon-1
+        pred_lls = vmap(_sliding_window_prediction_lls, in_axes=(None, None, None, 0, 0))(
+            mu_filtered[data_id], Sigma_filtered[data_id], obs_data[data_id],
+            np.arange(num_windows), jr.split(key, num_windows))
+        return pred_lls.mean()
+
+    def _sliding_window_prediction_lls(mu, Sigma, data, t, key):
         # Build the posterior object on the future latent states 
         # ("the posterior predictive distribution")
         # Convert unconstrained params to constrained dynamics parameters
         prior_params_constrained = model.prior.get_dynamics_params(prior_params)
         dynamics_params = {
-            "m1": mu,
-            "Q1": Sigma,
+            "m1": mu[t],
+            "Q1": Sigma[t],
             "A": prior_params_constrained["A"],
             "b": prior_params_constrained["b"],
             "Q": prior_params_constrained["Q"]
         }
-        tridiag_params = dynamics_to_tridiag(dynamics_params, T+1, D) # Note the +1
+        tridiag_params = dynamics_to_tridiag(dynamics_params, horizon+1, D) # Note the +1
         J, L, h = tridiag_params["J"], tridiag_params["L"], tridiag_params["h"]
         pred_posterior = MultivariateNormalBlockTridiag.infer(J, L, h)
         # Sample from it and evaluate the log likelihood
         x_pred = pred_posterior.sample(seed=key)[1:]
         likelihood_dist = model.decoder.apply(model_params["dec_params"], x_pred)
-        return likelihood_dist.log_prob(data)
+        return likelihood_dist.log_prob(
+            lax.dynamic_slice(data, (t+1, 0, 0, 0), (horizon,) + data.shape[1:])).sum(axis=(1, 2, 3))
 
-    pred_lls = vmap(_prediction_lls)(
-        out_dict["posterior_params"], data_batch, jr.split(key, N))
+    # pred_lls = vmap(_prediction_lls)(
+    #     out_dict["posterior_params"], data_batch, jr.split(key, N))
+    pred_lls = vmap(_prediction_lls)(np.arange(N), jr.split(key, N))
     out_dict["prediction_ll"] = pred_lls
     return obj, out_dict
 
@@ -3010,7 +3036,7 @@ def generate_pendulums(file_path, task,
 
 """The full dataset is (2000, 100, 24, 24, 1)"""
 
-# @title Create the pendulum dataset (uncomment this line!)
+# @title Create the pendulum dataset (uncomment this block!)
 # Takes about 2 minutes
 # generate_pendulums("pendulum", "regression", seq_len=200)
 # generate_pendulums("pendulum", "regression", 
@@ -3278,7 +3304,7 @@ def expand_pendulum_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-Pendulum-ICML-2",
+        "project_name": "SVAE-Pendulum-ICML-3",
         "log_to_wandb": True,
         "dataset": "pendulum",
         # Must be model learning
@@ -3302,7 +3328,8 @@ def expand_pendulum_parameters(params):
         "learning_rate": lr, 
         "prior_learning_rate": prior_lr,
         "use_validation": True,
-        "constrain_dynamics": True
+        "constrain_dynamics": True,
+        "prediction_horizon": 5,
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
