@@ -1,4 +1,4 @@
-"""# Set up everything"""
+"""# Set everything up"""
 
 # @title Imports
 # Misc
@@ -36,11 +36,19 @@ from flax.core import frozen_dict as fd
 # Tensorflow probability
 import tensorflow_probability.substrates.jax as tfp
 import tensorflow_probability.substrates.jax.distributions as tfd
+from tensorflow_probability.python.internal import reparameterization
+MVN = tfd.MultivariateNormalFullCovariance
+
+# Dynamax (central to our implementation)
+from dynamax.linear_gaussian_ssm.inference import make_lgssm_params, lgssm_smoother
+# from dynamax.linear_gaussian_ssm.parallel_inference import lgssm_smoother as parallel_lgssm_smoother
+from dynamax.utils.utils import psd_solve
+
 # Common math functions
 from flax.linen import softplus, sigmoid
 from jax.scipy.special import logsumexp
 from jax.scipy.linalg import solve_triangular
-from jax.numpy.linalg import eigh, cholesky, svd, inv
+from jax.numpy.linalg import eigh, cholesky, svd, inv, solve
 
 # For typing in neural network utils
 from typing import (NamedTuple, Any, Callable, Sequence, Iterable, List, Optional, Tuple,
@@ -168,6 +176,11 @@ def scale_singular_values(A):
     _, s, _ = svd(A)
     return A / (np.maximum(1, np.max(s)))
 
+def truncate_singular_values(A):
+    eps = 1e-3
+    u, s, vt = svd(A)
+    return u @ np.diag(np.clip(s, eps, 1)) @ vt
+
 # Assume that h has a batch shape here
 def sample_info_gaussian(seed, J, h):
     # Avoid inversion.
@@ -183,56 +196,66 @@ def sample_info_gaussian_old(seed, J, h):
     return tfp.distributions.MultivariateNormalFullCovariance(
         loc=loc, covariance_matrix=cov).sample(sample_shape=(), seed=seed)
 
-# @title Kalman filtering and smoothing
-def block_tridiag_mvn_log_normalizer(J_diag, J_lower_diag, h):
-    # extract dimensions
-    num_timesteps, dim = J_diag.shape[:2]
+def random_rotation(seed, n, theta=None):
+    key1, key2 = jr.split(seed)
 
-    # Pad the L's with one extra set of zeros for the last predict step
-    J_lower_diag_pad = np.concatenate((J_lower_diag, 
-                                       np.zeros((1, dim, dim))), axis=0)
+    if theta is None:
+        # Sample a random, slow rotation
+        theta = 0.5 * np.pi * jr.uniform(key1)
 
-    def marginalize(carry, t):
-        Jp, hp, lp = carry
+    if n == 1:
+        return jr.uniform(key1) * np.eye(1)
 
-        # Condition
-        Jc = J_diag[t] + Jp
-        hc = h[t] + hp
+    rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    out = np.eye(n)
+    out = out.at[:2, :2].set(rot)
+    q = np.linalg.qr(jr.uniform(key2, shape=(n, n)))[0]
+    return q.dot(out).dot(q.T)
 
-        # Predict -- Cholesky approach seems unstable!
-        # sqrt_Jc = np.linalg.cholesky(Jc)
-        # trm1 = solve_triangular(sqrt_Jc, hc, lower=True)
-        # trm2 = solve_triangular(sqrt_Jc, J_lower_diag_pad[t].T, lower=True)
-        # log_Z = 0.5 * dim * np.log(2 * np.pi)
-        # log_Z += -np.sum(np.log(np.diag(sqrt_Jc)))  # sum these terms only to get approx log|J|
-        # log_Z += 0.5 * np.dot(trm1.T, trm1)
-        # Jp = -np.dot(trm2.T, trm2)
-        # hp = -np.dot(trm2.T, trm1)
+# Computes ATQ-1A in a way that's guaranteed to be symmetric
+def inv_quad_form(Q, A):
+    sqrt_Q = np.linalg.cholesky(Q)
+    trm = solve_triangular(sqrt_Q, A, lower=True, check_finite=False)
+    return trm.T @ trm
 
-        # Alternative predict step:
-        log_Z = 0.5 * dim * np.log(2 * np.pi)
-        log_Z += -0.5 * np.linalg.slogdet(Jc)[1]
-        log_Z += 0.5 * np.dot(hc, np.linalg.solve(Jc, hc))
-        Jp = -np.dot(J_lower_diag_pad[t], np.linalg.solve(Jc, J_lower_diag_pad[t].T))
-        Jp = (Jp + Jp.T) * .5   # Manual symmetrization
-        hp = -np.dot(J_lower_diag_pad[t], np.linalg.solve(Jc, hc))
+def inv_symmetric(Q):
+    sqrt_Q = np.linalg.cholesky(Q)
+    sqrt_Q_inv = np.linalg.inv(sqrt_Q)
+    return sqrt_Q_inv.T @ sqrt_Q_inv
 
-        new_carry = Jp, hp, lp + log_Z
-        return new_carry, (Jc, hc)
+# Converts from (A, b, Q) to (J, L, h)
+def dynamics_to_tridiag(dynamics_params, T, D):
+    Q1, m1, A, Q, b = dynamics_params["Q1"], \
+        dynamics_params["m1"], dynamics_params["A"], \
+        dynamics_params["Q"], dynamics_params["b"]
+    # diagonal blocks of precision matrix
+    J = np.zeros((T, D, D))
+    J = J.at[0].add(inv_symmetric(Q1))
 
-    # Initialize
-    Jp0 = np.zeros((dim, dim))
-    hp0 = np.zeros((dim,))
+    J = J.at[:-1].add(inv_quad_form(Q, A))
+    J = J.at[1:].add(inv_symmetric(Q))
+    # lower diagonal blocks of precision matrix
+    L = -np.linalg.solve(Q, A)
+    L = np.tile(L[None, :, :], (T - 1, 1, 1))
+    # linear potential
+    h = np.zeros((T, D)) 
+    h = h.at[0].add(np.linalg.solve(Q1, m1))
+    h = h.at[:-1].add(-np.dot(A.T, np.linalg.solve(Q, b)))
+    h = h.at[1:].add(np.linalg.solve(Q, b))
+    return { "J": J, "L": L, "h": h }
 
-    (_, _, log_Z), (filtered_Js, filtered_hs) = lax.scan(marginalize, 
-                            (Jp0, hp0, 0), np.arange(num_timesteps))
-    return log_Z, (filtered_Js, filtered_hs)
+# Helper function: solve a linear regression given expected sufficient statistics
+def fit_linear_regression(Ex, Ey, ExxT, EyxT, EyyT, En):
+    big_ExxT = np.row_stack([np.column_stack([ExxT, Ex]),
+                            np.concatenate( [Ex.T, np.array([En])])])
+    big_EyxT = np.column_stack([EyxT, Ey])
+    Cd = np.linalg.solve(big_ExxT, big_EyxT.T).T
+    C, d = Cd[:, :-1], Cd[:, -1]
+    R = (EyyT - 2 * Cd @ big_EyxT.T + Cd @ big_ExxT @ Cd.T) / En
 
-# @title Parallel scan version
-
-# TODO: implement this
-# Basically, we want a function that takes in (J, L, h) and outputs (log_Z, J_filtered, h_filtered)
-# However the original parallel Kalman works on (A, b, Q)
+    # Manually symmetrize R
+    R = (R + R.T) / 2
+    return C, d, R
 
 # @title Experiment scheduler
 LINE_SEP = "#" * 42
@@ -436,6 +459,8 @@ class SVAE:
         # Mask out a large window of states
         mask_size = params.get("mask_size")
         T = data.shape[0]
+        D = self.prior.latent_dims
+
         mask = onp.ones((T,))
         key, dropout_key = jr.split(key)
         if mask_size:
@@ -448,8 +473,16 @@ class SVAE:
             if params.get("mask_type") == "potential":
                 # This only works with svaes
                 potential = self.recognition.apply(rec_params, data)
+                # Uninformative potential
+                infinity = 1e5
+                uninf_potential = {"mu": np.zeros((T, D)), 
+                                   "Sigma": np.tile(np.eye(D) * infinity, (T, 1, 1))}
+                # Replace masked parts with uninformative potentials
                 potential = tree_map(
-                    lambda t: np.einsum("i,i...->i...", mask[:t.shape[0]], t), potential)
+                    lambda t1, t2: np.einsum("i,i...->i...", mask[:t1.shape[0]], t1) 
+                                 + np.einsum("i,i...->i...", 1-mask[:t2.shape[0]], t2), 
+                    potential, 
+                    uninf_potential)
             else:
                 potential = self.recognition.apply(rec_params, 
                                                    np.einsum("t...,t->t...", data, mask))
@@ -542,7 +575,7 @@ class SVAEPrior:
     
     def sample(self, params, shape, key):
         return self.distribution(
-            self.get_constrained_params(params)).sample(shape, seed=key)
+            self.get_constrained_params(params)).sample(sample_shape=shape, seed=key)
 
     def get_constrained_params(self, params):
         return deepcopy(params)
@@ -551,10 +584,53 @@ class SVAEPrior:
     def shape(self):
         raise NotImplementedError
 
-"""## Important distributions"""
+"""## Information form (deprecated)"""
 
 # @title MVN tridiag object (taken from ssm)
 from tensorflow_probability.python.internal import reparameterization
+
+def block_tridiag_mvn_log_normalizer(J_diag, J_lower_diag, h):
+    """ TODO
+    """
+    # extract dimensions
+    num_timesteps, dim = J_diag.shape[:2]
+
+    # Pad the L's with one extra set of zeros for the last predict step
+    J_lower_diag_pad = np.concatenate((J_lower_diag, np.zeros((1, dim, dim))), axis=0)
+
+    def marginalize(carry, t):
+        Jp, hp, lp = carry
+
+        # Condition
+        Jc = J_diag[t] + Jp
+        hc = h[t] + hp
+
+        # Predict -- Cholesky approach seems unstable!
+        # sqrt_Jc = np.linalg.cholesky(Jc)
+        # trm1 = solve_triangular(sqrt_Jc, hc, lower=True)
+        # trm2 = solve_triangular(sqrt_Jc, J_lower_diag_pad[t].T, lower=True)
+        # log_Z = 0.5 * dim * np.log(2 * np.pi)
+        # log_Z += -np.sum(np.log(np.diag(sqrt_Jc)))  # sum these terms only to get approx log|J|
+        # log_Z += 0.5 * np.dot(trm1.T, trm1)
+        # Jp = -np.dot(trm2.T, trm2)
+        # hp = -np.dot(trm2.T, trm1)
+
+        # Alternative predict step:
+        log_Z = 0.5 * dim * np.log(2 * np.pi)
+        log_Z += -0.5 * np.linalg.slogdet(Jc)[1]
+        log_Z += 0.5 * np.dot(hc, np.linalg.solve(Jc, hc))
+        Jp = -np.dot(J_lower_diag_pad[t], np.linalg.solve(Jc, J_lower_diag_pad[t].T))
+        # Jp = (Jp + Jp.T) * .5   # Manual symmetrization
+        hp = -np.dot(J_lower_diag_pad[t], np.linalg.solve(Jc, hc))
+
+        new_carry = Jp, hp, lp + log_Z
+        return new_carry, (Jc, hc)
+
+    # Initialize
+    Jp0 = np.zeros((dim, dim))
+    hp0 = np.zeros((dim,))
+    (_, _, log_Z), (filtered_Js, filtered_hs) = lax.scan(marginalize, (Jp0, hp0, 0), np.arange(num_timesteps))
+    return log_Z, (filtered_Js, filtered_hs)
 
 class MultivariateNormalBlockTridiag(tfd.Distribution):
     """
@@ -780,17 +856,17 @@ class MultivariateNormalBlockTridiag(tfd.Distribution):
 
         def sample_single(seed, filtered_Js, filtered_hs, J_lower_diag):
 
-            # def _sample_info_gaussian(seed, J, h, sample_shape=()):
-            #     # TODO: avoid inversion.
-            #     # see https://github.com/mattjj/pybasicbayes/blob/master/pybasicbayes/util/stats.py#L117-L122
-            #     # L = np.linalg.cholesky(J)
-            #     # x = np.random.randn(h.shape[0])
-            #     # return scipy.linalg.solve_triangular(L,x,lower=True,trans='T') \
-            #     #     + dpotrs(L,h,lower=True)[0]
-            #     cov = np.linalg.inv(J)
-            #     loc = np.einsum("...ij,...j->...i", cov, h)
-            #     return tfp.distributions.MultivariateNormalFullCovariance(
-            #         loc=loc, covariance_matrix=cov).sample(sample_shape=sample_shape, seed=seed)
+            def _sample_info_gaussian(seed, J, h, sample_shape=()):
+                # TODO: avoid inversion.
+                # see https://github.com/mattjj/pybasicbayes/blob/master/pybasicbayes/util/stats.py#L117-L122
+                # L = np.linalg.cholesky(J)
+                # x = np.random.randn(h.shape[0])
+                # return scipy.linalg.solve_triangular(L,x,lower=True,trans='T') \
+                #     + dpotrs(L,h,lower=True)[0]
+                cov = np.linalg.inv(J)
+                loc = np.einsum("...ij,...j->...i", cov, h)
+                return tfp.distributions.MultivariateNormalFullCovariance(
+                    loc=loc, covariance_matrix=cov).sample(sample_shape=sample_shape, seed=seed)
 
             def _step(carry, inpt):
                 x_next, seed = carry
@@ -802,12 +878,12 @@ class MultivariateNormalBlockTridiag(tfd.Distribution):
 
                 # Split the seed
                 seed, this_seed = jr.split(seed)
-                x = sample_info_gaussian(this_seed, Jc, hc)
+                x = _sample_info_gaussian(this_seed, Jc, hc)
                 return (x, seed), x
 
             # Initialize with sample of last timestep and sample in reverse
             seed_T, seed = jr.split(seed)
-            x_T = sample_info_gaussian(seed_T, filtered_Js[-1], filtered_hs[-1][None] * np.ones((n, 1)))
+            x_T = _sample_info_gaussian(seed_T, filtered_Js[-1], filtered_hs[-1], sample_shape=(n,))
             inputs = (filtered_Js[:-1][::-1], filtered_hs[:-1][::-1], J_lower_diag[::-1])
             _, x_rev = lax.scan(_step, (x_T, seed), inputs)
 
@@ -866,73 +942,203 @@ class MultivariateNormalBlockTridiag(tfd.Distribution):
     def tree_unflatten(cls, aux_data, children):
         return cls(*children)
 
+"""## Important distributions"""
+
+# @title Linear Gaussian chain distribution object
+# As a prior distribution, we only need to be able to 1) Evaluate log prob 2) sample
+# As a posterior distribution, we also need to figure out the sufficient stats (Ex, ExxT, ExnxT)
+class LinearGaussianChain:
+    def __init__(self, dynamics_matrix, dynamics_bias, noise_covariance,
+                 expected_states, expected_states_squared, expected_states_next_states):
+        """
+        params: dictionary containing the following keys:
+            A:  (seq_len, dim, dim)
+            Q:  (seq_len, dim, dim)
+            b:  (seq_len, dim)
+        """
+        self._dynamics_matrix = dynamics_matrix
+        self._dynamics_bias = dynamics_bias
+        self._noise_covariance = noise_covariance
+        self._expected_states = expected_states
+        self._expected_states_squared = expected_states_squared
+        self._expected_states_next_states = expected_states_next_states
+
+    @classmethod
+    def from_stationary_dynamics(cls, m1, Q1, A, b, Q, T):
+        dynamics_matrix = np.tile(A[None], (T, 1, 1))
+        dynamics_bias = np.concatenate([m1[None], 
+                                        np.tile(b[None], (T-1, 1))])
+        noise_covariance = np.concatenate([Q1[None], 
+                                           np.tile(Q[None], (T-1, 1, 1))])
+        return cls.from_nonstationary_dynamics(dynamics_matrix, dynamics_bias, noise_covariance)
+    
+    @classmethod
+    def from_nonstationary_dynamics(cls, dynamics_matrix, dynamics_bias, noise_covariance):
+        # Compute the means and covariances via parallel scan
+        init_elems = (dynamics_matrix, dynamics_bias, noise_covariance)
+
+        @vmap
+        def assoc_op(elem1, elem2):
+            A1, b1, Q1 = elem1
+            A2, b2, Q2 = elem2
+            return A2 @ A1, A2 @ b1 + b2, A2 @ Q1 @ A2.T + Q2
+
+        _, Ex, covariances = lax.associative_scan(assoc_op, init_elems)
+        expected_states = Ex
+        expected_states_squared = covariances + np.einsum("...i,...j->...ij", Ex, Ex)
+        expected_states_next_states = np.einsum("...ij,...jk->...ik", 
+            covariances[:-1], dynamics_matrix[1:]) + np.einsum("...i,...j->...ji", Ex[:-1], Ex[1:])
+
+        return cls(dynamics_matrix, dynamics_bias, noise_covariance,
+                   expected_states, expected_states_squared, expected_states_next_states)
+
+    @property
+    def mean(self):
+        return self._expected_states
+
+    @property
+    def covariance(self):
+        Ex = self._expected_states
+        ExxT = self._expected_states_squared
+        return ExxT - np.einsum("...i,...j->...ij", Ex, Ex)
+        
+    @property
+    def expected_states(self):
+        return self._expected_states
+
+    @property
+    def expected_states_squared(self):
+        return self._expected_states_squared
+
+    @property
+    def expected_states_next_states(self):
+        return self._expected_states_next_states
+
+    # Works with batched distributions and arguments...!
+    def log_prob(self, xs):
+
+        @partial(np.vectorize, signature="(t,d,d),(t,d),(t,d,d),(t,d)->()")
+        def log_prob_single(A, b, Q, x):
+            ll = MVN(loc=b[0], covariance_matrix=Q[0]).log_prob(x[0])
+            ll += MVN(loc=np.einsum("tij,tj->ti", A[1:], x[:-1]) + b[1:], 
+                      covariance_matrix=Q[1:]).log_prob(x[1:]).sum()
+            return ll
+
+        return log_prob_single(self._dynamics_matrix,
+                               self._dynamics_bias, 
+                               self._noise_covariance, xs)
+        
+    # Only supports 0d and 1d sample shapes
+    # Does not support sampling with batched object
+    def sample(self, seed, sample_shape=()):
+
+        @partial(np.vectorize, signature="(n),(t,d,d),(t,d),(t,d,d)->(t,d)")
+        def sample_single(key, A, b, Q):
+
+            biases = MVN(loc=b, covariance_matrix=Q).sample(seed=key)
+            init_elems = (A, biases)
+
+            @vmap
+            def assoc_op(elem1, elem2):
+                A1, b1 = elem1
+                A2, b2 = elem2
+                return A2 @ A1, A2 @ b1 + b2
+
+            _, sample = lax.associative_scan(assoc_op, init_elems)
+            return sample
+        
+        if (len(sample_shape) == 0):
+            return sample_single(seed, self._dynamics_matrix,
+                                 self._dynamics_bias, 
+                                 self._noise_covariance)
+        elif (len(sample_shape) == 1):
+            return sample_single(jr.split(seed, sample_shape[0]),
+                                 self._dynamics_matrix[None],
+                                 self._dynamics_bias[None],
+                                 self._noise_covariance[None]) 
+        else:
+            raise Exception("More than one sample dimensions are not supported!")
+
+    def entropy(self):
+        """
+        Compute the entropy
+
+            H[X] = -E[\log p(x)]
+                 = -E[-1/2 x^T J x + x^T h - log Z(J, h)]
+                 = 1/2 <J, E[x x^T] - <h, E[x]> + log Z(J, h)
+        """
+        Ex = self.expected_states
+        ExxT = self.expected_states_squared
+        ExnxT = self.expected_states_next_states
+        
+        dim = Ex.shape[-1]        
+        Q_inv = solve(self._noise_covariance, np.eye(dim)[None])
+        A = self._dynamics_matrix
+
+        J_lower_diag = np.einsum("til,tlj->tij", -Q_inv[1:], A[1:])
+        ATQinvA = np.einsum("tji,tjl,tlk->tik", A[1:], Q_inv[1:], A[1:])
+        J_diag = Q_inv.at[:-1].add(ATQinvA)
+
+        Sigmatt = ExxT - np.einsum("ti,tj->tij", Ex, Ex)
+        Sigmatnt = ExnxT - np.einsum("ti,tj->tji", Ex[:-1], Ex[1:])
+
+        trm1 = 0.5 * np.sum(J_diag * Sigmatt)
+        trm2 = np.sum(J_lower_diag * Sigmatnt)
+
+        return trm1 + trm2 - self.log_prob(Ex)
+
+# @title Testing the correctness of the linear Gaussian chain
+# jax.config.update("jax_enable_x64", True)
+
+# D = 3
+# T = 200
+
+# mu1 = np.zeros(D)
+# Q1 = np.eye(D)
+# # TODO: A could be a sensitive parameter
+# # A = jnp.linspace(0.001, 1.0, D)
+# A = random_rotation(key_0, D, np.pi / 20)
+# b = jr.normal(key_0, shape=(D,))#np.zeros(D)
+# Q = np.eye(D)
+
+# C = np.eye(D)
+# d = np.zeros(D)
+
+# dist = LinearGaussianChain.from_stationary_dynamics(mu1, Q1, A, b, Q, T)
+# dist.entropy()
+# # Sigmas = np.tile(0.01 * np.eye(D), (T, 1, 1))
+
+# p = dynamics_to_tridiag({"m1": mu1, "Q1": Q1, "A": A, "b": b, "Q": Q}, T, D)
+# dist_ = MultivariateNormalBlockTridiag.infer(p["J"], p["L"], p["h"])
+
+# ExnxT_ = dist_.expected_states_next_states
+# ExnxT = dist.expected_states_next_states
+# print(ExnxT - ExnxT_)
+# print(dist_.entropy() - dist.entropy())
+# print(dist.expected_states_squared - dist_.expected_states_squared)
+# posterior = LinearGaussianChain.from_stationary_dynamics(mu1, Q1, A, b, Q, T)
+# key_1 = jr.split(key_0)[0]
+# A1 = random_rotation(key_1, D, np.pi / 20)
+# b1 = jr.normal(key_1, shape=(D,))#np.zeros(D)
+# prior_params = dynamics_to_tridiag({"m1": mu1, "Q1": Q1, "A": A1, "b": b1, "Q": Q}, T, D)
+# prior = LinearGaussianChain.from_stationary_dynamics(mu1, Q1, A1, b1, Q, T)
+# Ex = posterior.expected_states
+# ExxT = posterior.expected_states_squared
+# ExnxT = posterior.expected_states_next_states
+# Sigmatt = ExxT - np.einsum("ti,tj->tij", Ex, Ex)
+# Sigmatnt = ExnxT - np.einsum("ti,tj->tji", Ex[:-1], Ex[1:])
+# J, L = prior_params["J"], prior_params["L"]
+# cross_entropy = -prior.log_prob(Ex)
+# cross_entropy += 0.5 * np.einsum("tij,tij->", J, Sigmatt) 
+# cross_entropy += np.einsum("tij,tij->", L, Sigmatnt)
+# print("Closed form KL:", cross_entropy - posterior.entropy())
+# samples = posterior.sample(key_1, (100,))
+# print("Sampled KL:", np.mean(posterior.log_prob(samples) - prior.log_prob(samples)))
+# # return np.mean(posterior.log_prob(samples) - prior.log_prob(samples))
+
 # @title Linear Gaussian chain prior
-def random_rotation(seed, n, theta=None):
-    key1, key2 = jr.split(seed)
-
-    if theta is None:
-        # Sample a random, slow rotation
-        theta = 0.5 * np.pi * jr.uniform(key1)
-
-    if n == 1:
-        return jr.uniform(key1) * np.eye(1)
-
-    rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-    out = np.eye(n)
-    out = out.at[:2, :2].set(rot)
-    q = np.linalg.qr(jr.uniform(key2, shape=(n, n)))[0]
-    return q.dot(out).dot(q.T)
-
-# Computes ATQ-1A in a way that's guaranteed to be symmetric
-def inv_quad_form(Q, A):
-    sqrt_Q = np.linalg.cholesky(Q)
-    trm = solve_triangular(sqrt_Q, A, lower=True, check_finite=False)
-    return trm.T @ trm
-
-def inv_symmetric(Q):
-    sqrt_Q = np.linalg.cholesky(Q)
-    sqrt_Q_inv = np.linalg.inv(sqrt_Q)
-    return sqrt_Q_inv.T @ sqrt_Q_inv
-
-# Converts from (A, b, Q) to (J, L, h)
-def dynamics_to_tridiag(dynamics_params, T, D):
-    Q1, m1, A, Q, b = dynamics_params["Q1"], \
-        dynamics_params["m1"], dynamics_params["A"], \
-        dynamics_params["Q"], dynamics_params["b"]
-    # diagonal blocks of precision matrix
-    J = np.zeros((T, D, D))
-    J = J.at[0].add(inv_symmetric(Q1))
-
-    J = J.at[:-1].add(inv_quad_form(Q, A))
-    J = J.at[1:].add(inv_symmetric(Q))
-    # lower diagonal blocks of precision matrix
-    L = -np.linalg.solve(Q, A)
-    L = np.tile(L[None, :, :], (T - 1, 1, 1))
-    # linear potential
-    h = np.zeros((T, D)) 
-    h = h.at[0].add(np.linalg.solve(Q1, m1))
-    h = h.at[:-1].add(-np.dot(A.T, np.linalg.solve(Q, b)))
-    h = h.at[1:].add(np.linalg.solve(Q, b))
-    return { "J": J, "L": L, "h": h }
-
-# Helper function: solve a linear regression given expected sufficient statistics
-def fit_linear_regression(Ex, Ey, ExxT, EyxT, EyyT, En):
-    big_ExxT = np.row_stack([np.column_stack([ExxT, Ex]),
-                            np.concatenate( [Ex.T, np.array([En])])])
-    big_EyxT = np.column_stack([EyxT, Ey])
-    Cd = np.linalg.solve(big_ExxT, big_EyxT.T).T
-    C, d = Cd[:, :-1], Cd[:, -1]
-    R = (EyyT - 2 * Cd @ big_EyxT.T + Cd @ big_ExxT @ Cd.T) / En
-
-    # Manually symmetrize R
-    R = (R + R.T) / 2
-    return C, d, R
-
 # This is a linear Gaussian chain
-class LinearGaussianChain(SVAEPrior):
-
-    # We're not using this at the moment
-    # COVARIANCE_REGULARIZATION = 1e-3
+class LinearGaussianChainPrior(SVAEPrior):
 
     def __init__(self, latent_dims, seq_len):
         self.latent_dims = latent_dims
@@ -946,11 +1152,9 @@ class LinearGaussianChain(SVAEPrior):
 
     # Must be the full set of constrained parameters!
     def distribution(self, params):
-        J, L, h = params["J"], params["L"], params["h"]
-        log_Z, J_filtered, h_filtered = params["log_Z"], params["J_filtered"], params["h_filtered"]
+        As, bs, Qs = params["As"], params["bs"], params["Qs"]
         Ex, ExxT, ExnxT = params["Ex"], params["ExxT"], params["ExnxT"]
-        return MultivariateNormalBlockTridiag(J, L, h, 
-            log_Z, J_filtered, h_filtered, Ex, ExxT, ExnxT)
+        return LinearGaussianChain(As, bs, Qs, Ex, ExxT, ExnxT)
 
     def init(self, key):
         T, D = self.seq_len, self.latent_dims
@@ -963,22 +1167,21 @@ class LinearGaussianChain(SVAEPrior):
             "Q": np.eye(D)
         }
         constrained = self.get_constrained_params(params)
-        params["avg_suff_stats"] = { "Ex": constrained["Ex"], 
-                                    "ExxT": constrained["ExxT"], 
-                                    "ExnxT": constrained["ExnxT"] }
         return params
 
     def get_dynamics_params(self, params):
         return params
 
     def get_constrained_params(self, params):
-        p = dynamics_to_tridiag(params, self.seq_len, self.latent_dims)
-        J, L, h = p["J"], p["L"], p["h"]
-        dist = MultivariateNormalBlockTridiag.infer(J, L, h)
+        p = copy.deepcopy(params)
+        tridiag = dynamics_to_tridiag(params, self.seq_len, self.latent_dims)
+        p.update(tridiag)
+        dist = LinearGaussianChain.from_stationary_dynamics(p["m1"], p["Q1"], 
+                                         p["A"], p["b"], p["Q"], self.seq_len)
         p.update({
-            "log_Z": dist.log_normalizer,
-            "J_filtered": dist.filtered_precisions,
-            "h_filtered": dist.filtered_linear_potentials,
+            "As": dist._dynamics_matrix,
+            "bs": dist._dynamics_bias,
+            "Qs": dist._noise_covariance,
             "Ex": dist.expected_states,
             "ExxT": dist.expected_states_squared,
             "ExnxT": dist.expected_states_next_states
@@ -1008,7 +1211,7 @@ class LinearGaussianChain(SVAEPrior):
 
 # This is a bit clumsy but it's the best we can do without using some sophisticated way
 # Of marking the constrained/optimized parameters vs. unconstrained parameters
-class LieParameterizedLinearGaussianChain(LinearGaussianChain):
+class LieParameterizedLinearGaussianChainPrior(LinearGaussianChainPrior):
     def init(self, key):
         D = self.latent_dims
         key_A, key = jr.split(key, 2)
@@ -1039,29 +1242,26 @@ class LieParameterizedLinearGaussianChain(LinearGaussianChain):
 
 # @title Linear Gaussian chain posteriors
 
-# Technically these are not (homogenous) linear Gaussian chains...
-class LinearGaussianChainPosterior(LinearGaussianChain):
+# The infer function for the DKF version just uses the posterior params 
+class CDKFPosterior(LinearGaussianChainPrior):
     def init(self, key):
         T, D = self.seq_len, self.latent_dims
         params = {
-            "J": np.tile(np.eye(D)[None], (T, 1, 1)),
-            "L": np.zeros((T-1, D, D)),
-            "h": np.zeros((T, D))
+            "As": np.zeros((T, D, D)), 
+            "bs": np.zeros((T, D)),
+            "Qs": np.tile(np.eye(D)[None], (T, 1, 1))
         }
         return self.get_constrained_params(params)
 
     def get_constrained_params(self, params):
-        J, L, h = params["J"], params["L"], params["h"]
-        dist = MultivariateNormalBlockTridiag.infer(J, L, h)
-        params.update({
-            "log_Z": dist.log_normalizer,
-            "J_filtered": dist.filtered_precisions,
-            "h_filtered": dist.filtered_linear_potentials,
+        p = copy.deepcopy(params)
+        dist = LinearGaussianChain.from_nonstationary_dynamics(p["As"], p["bs"], p["Qs"])
+        p.update({
             "Ex": dist.expected_states,
             "ExxT": dist.expected_states_squared,
             "ExnxT": dist.expected_states_next_states
         })
-        return params
+        return p
 
     def sufficient_statistics(self, params):
         return {
@@ -1070,25 +1270,29 @@ class LinearGaussianChainPosterior(LinearGaussianChain):
             "ExnxT": params["ExnxT"]
         }
 
-# The SVAE version has an inference function 
-# that combines prior and potential params
-class LDSSVAEPosterior(LinearGaussianChainPosterior):
-    def infer(self, prior_params, potential_params):
-        prior_J, prior_L, prior_h = prior_params["J"], prior_params["L"], prior_params["h"]
-        params = {
-            "J": prior_J + potential_params["J"],
-            "L": prior_L,
-            "h": prior_h + potential_params["h"]
-        }
-        return self.get_constrained_params(params)
-
-# The infer function for the DKF version just uses the posterior params 
-class DKFPosterior(LinearGaussianChainPosterior):
     def infer(self, prior_params, posterior_params):
         return self.get_constrained_params(posterior_params)
 
+class DKFPosterior(CDKFPosterior):
+    def get_constrained_params(self, params):
+        p = copy.deepcopy(params)
+        # The DKF produces a factored posterior
+        # So we don't need the dynamics matrix
+        p.pop("As", None)
+        return p
+
+    def distribution(self, params):
+        T, D = self.seq_len, self.latent_dims
+        bs, Qs = params["bs"], params["Qs"]
+        dist = MVN(loc=bs, covariance_matrix=Qs)
+        dist.expected_states = bs
+        dist.expected_states_squared = np.einsum("...i,...j->...ij", bs, bs) + Qs
+        dist.expected_states_next_states = np.einsum("...i,...j->...ji", bs[:-1], bs[1:])
+        return dist
+
 # @title PlaNet type posterior
 # The infer function for the DKF version just uses the posterior params 
+# TODO: Put the dummies in the params dictionary as well
 class PlaNetPosterior(DKFPosterior):
     def __init__(self, network_params, latent_dims, seq_len):
         super().__init__(latent_dims, seq_len)
@@ -1184,6 +1388,7 @@ class DeepAutoregressiveDynamics:
             return np.sum(log_probs, axis=0)
         return vmap(log_prob_single)(xs)
 
+    # TODO: make this work with a batched distribution object
     # Only supports rank 0 and 1 sample shapes
     # Output: ([num_samples,] [batch_size,] seq_len, event_dim)
     def sample(self, sample_shape, seed):
@@ -1228,14 +1433,14 @@ class DeepAutoregressiveDynamics:
                         )
                     )(jr.split(seed, sample_shape[0]))
 
-# @title LDS object
+# @title LDS object (might wanna refactor this)
 
 # Takes a linear Gaussian chain as its base
-class LDS(LinearGaussianChain):
-    def __init__(self, latent_dims, seq_len, base=None):
+class LDS(LinearGaussianChainPrior):
+    def __init__(self, latent_dims, seq_len, base=None, posterior=None):
         super().__init__(latent_dims, seq_len)
-        self.posterior = LDSSVAEPosterior(latent_dims, seq_len)
-        self.base = base or LinearGaussianChain(latent_dims, seq_len) # Slightly redundant...
+        self.posterior = posterior or LDSSVAEPosterior(latent_dims, seq_len)
+        self.base = base or LinearGaussianChainPrior(latent_dims, seq_len) # Slightly redundant...
 
     # Takes unconstrained params
     def sample(self, params, shape, key):
@@ -1268,14 +1473,661 @@ class LDS(LinearGaussianChain):
         # linear potential
         h = np.dot(data - d, np.linalg.solve(R, C))
 
-        return self.posterior.infer(self.base.get_constrained_params(params), {"J": J, "h": h})
+        Sigma = solve(J, np.eye(self.latent_dims)[None])
+        mu = vmap(solve)(J, h)
+
+        return self.posterior.infer(self.base.get_constrained_params(params), {"J": J, "h": h, 
+                                                                    "mu": mu, "Sigma": Sigma})
         
     # Also assumes single data points
     def marginal_log_likelihood(self, params, data):
         posterior = self.posterior.distribution(self.e_step(params, data))
         states = posterior.mean()
-        lps = self.log_prob(params, states, data) - posterior.log_prob(states)
+        prior_ll = self.log_prob(params, states, data)
+        posterior_ll = posterior.log_prob(states)
+        # This is numerically unstable!
+        lps = prior_ll - posterior_ll
         return lps
+
+"""## Making a mean parameter posterior object"""
+
+# @title Parallel Kalman filtering and smoothing
+
+def _make_associative_sampling_elements(params, key, filtered_means, filtered_covariances):
+    """Preprocess filtering output to construct input for smoothing assocative scan."""
+
+    F = params["A"]
+    Q = params["Q"]
+
+    def _last_sampling_element(key, m, P):
+        return np.zeros_like(P), MVN(m, P).sample(seed=key)
+
+    def _generic_sampling_element(params, key, m, P):
+
+        eps = 1e-3
+        P += np.eye(dims) * eps
+        Pp = F @ P @ F.T + Q
+
+        FP = F @ P
+        E  = psd_solve(Pp, FP).T
+        g  = m - E @ F @ m
+        L  = P - E @ Pp @ E.T
+
+        L = (L + L.T) * .5 + np.eye(dims) * eps # Add eps to the crucial covariance matrix
+
+        h = MVN(g, L).sample(seed=key)
+        return E, h
+
+    num_timesteps = len(filtered_means)
+    dims = filtered_means.shape[-1]
+    keys = jr.split(key, num_timesteps)
+    last_elems = _last_sampling_element(keys[-1], filtered_means[-1], 
+                                        filtered_covariances[-1])
+    generic_elems = vmap(_generic_sampling_element, (None, 0, 0, 0))(
+        params, keys[:-1], filtered_means[:-1], filtered_covariances[:-1]
+        )
+    combined_elems = tuple(np.append(gen_elm, last_elm[None,:], axis=0)
+                           for gen_elm, last_elm in zip(generic_elems, last_elems))
+    return combined_elems
+
+def _make_associative_filtering_elements(params, potentials):
+    """Preprocess observations to construct input for filtering assocative scan."""
+
+    F = params["A"]
+    Q = params["Q"]
+    Q1 = params["Q1"]
+    P0 = Q1
+    P1 = Q1
+    m1 = params["m1"]
+    dim = Q.shape[0]
+    H = np.eye(dim)
+
+    def _first_filtering_element(params, mu, Sigma):
+
+        y, R = mu, Sigma
+
+        S = H @ Q @ H.T + R
+        CF, low = scipy.linalg.cho_factor(S)
+
+        S1 = H @ P1 @ H.T + R
+        K1 = psd_solve(S1, H @ P1).T
+
+        A = np.zeros_like(F)
+        b = m1 + K1 @ (y - H @ m1)
+        C = P1 - K1 @ S1 @ K1.T
+        eta = F.T @ H.T @ scipy.linalg.cho_solve((CF, low), y)
+        J = F.T @ H.T @ scipy.linalg.cho_solve((CF, low), H @ F)
+
+        logZ = -MVN(loc=np.zeros_like(y), covariance_matrix=H @ P0 @ H.T + R).log_prob(y)
+
+        return A, b, C, J, eta, logZ
+
+
+    def _generic_filtering_element(params, mu, Sigma):
+
+        y, R = mu, Sigma
+
+        S = H @ Q @ H.T + R
+        CF, low = scipy.linalg.cho_factor(S)
+        K = scipy.linalg.cho_solve((CF, low), H @ Q).T
+        A = F - K @ H @ F
+        b = K @ y
+        C = Q - K @ H @ Q
+
+        eta = F.T @ H.T @ scipy.linalg.cho_solve((CF, low), y)
+        J = F.T @ H.T @ scipy.linalg.cho_solve((CF, low), H @ F)
+
+        logZ = -MVN(loc=np.zeros_like(y), covariance_matrix=S).log_prob(y)
+
+        return A, b, C, J, eta, logZ
+
+    mus, Sigmas = potentials["mu"], potentials["Sigma"]
+
+    first_elems = _first_filtering_element(params, mus[0], Sigmas[0])
+    generic_elems = vmap(_generic_filtering_element, (None, 0, 0))(params, mus[1:], Sigmas[1:])
+    combined_elems = tuple(np.concatenate((first_elm[None,...], gen_elm))
+                           for first_elm, gen_elm in zip(first_elems, generic_elems))
+    return combined_elems
+
+def lgssm_filter(params, emissions):
+    """A parallel version of the lgssm filtering algorithm.
+    See S. Särkkä and Á. F. García-Fernández (2021) - https://arxiv.org/abs/1905.13002.
+    Note: This function does not yet handle `inputs` to the system.
+    """
+
+    initial_elements = _make_associative_filtering_elements(params, emissions)
+
+    @vmap
+    def filtering_operator(elem1, elem2):
+        A1, b1, C1, J1, eta1, logZ1 = elem1
+        A2, b2, C2, J2, eta2, logZ2 = elem2
+        dim = A1.shape[0]
+        I = np.eye(dim)
+
+        I_C1J2 = I + C1 @ J2
+        temp = scipy.linalg.solve(I_C1J2.T, A2.T).T
+        A = temp @ A1
+        b = temp @ (b1 + C1 @ eta2) + b2
+        C = temp @ C1 @ A2.T + C2
+
+        I_J2C1 = I + J2 @ C1
+        temp = scipy.linalg.solve(I_J2C1.T, A1).T
+
+        eta = temp @ (eta2 - J2 @ b1) + eta1
+        J = temp @ J2 @ A1 + J1
+
+        # mu = scipy.linalg.solve(J2, eta2)
+        # t2 = - eta2 @ mu + (b1 - mu) @ scipy.linalg.solve(I_J2C1, (J2 @ b1 - eta2))
+
+        mu = np.linalg.solve(C1, b1)
+        t1 = (b1 @ mu - (eta2 + mu) @ np.linalg.solve(I_C1J2, C1 @ eta2 + b1))
+
+        logZ = (logZ1 + logZ2 + 0.5 * np.linalg.slogdet(I_C1J2)[1] + 0.5 * t1)
+
+        return A, b, C, J, eta, logZ
+
+    _, filtered_means, filtered_covs, _, _, logZ = lax.associative_scan(
+                                                filtering_operator, initial_elements
+                                                )
+
+    return {
+        "marginal_logliks": -logZ,
+        "marginal_loglik": -logZ[-1],
+        "filtered_means": filtered_means, 
+        "filtered_covariances": filtered_covs
+    }
+
+def _make_associative_smoothing_elements(params, filtered_means, filtered_covariances):
+    """Preprocess filtering output to construct input for smoothing assocative scan."""
+
+    F = params["A"]
+    Q = params["Q"]
+
+    def _last_smoothing_element(m, P):
+        return np.zeros_like(P), m, P
+
+    def _generic_smoothing_element(params, m, P):
+
+        Pp = F @ P @ F.T + Q
+
+        E  = psd_solve(Pp, F @ P).T
+        g  = m - E @ F @ m
+        L  = P - E @ Pp @ E.T
+        return E, g, L
+
+    last_elems = _last_smoothing_element(filtered_means[-1], filtered_covariances[-1])
+    generic_elems = vmap(_generic_smoothing_element, (None, 0, 0))(
+        params, filtered_means[:-1], filtered_covariances[:-1]
+        )
+    combined_elems = tuple(np.append(gen_elm, last_elm[None,:], axis=0)
+                           for gen_elm, last_elm in zip(generic_elems, last_elems))
+    return combined_elems
+
+
+def parallel_lgssm_smoother(params, emissions):
+    """A parallel version of the lgssm smoothing algorithm.
+    See S. Särkkä and Á. F. García-Fernández (2021) - https://arxiv.org/abs/1905.13002.
+    Note: This function does not yet handle `inputs` to the system.
+    """
+    filtered_posterior = lgssm_filter(params, emissions)
+    filtered_means = filtered_posterior["filtered_means"]
+    filtered_covs = filtered_posterior["filtered_covariances"]
+    initial_elements = _make_associative_smoothing_elements(params, filtered_means, filtered_covs)
+
+    @vmap
+    def smoothing_operator(elem1, elem2):
+        E1, g1, L1 = elem1
+        E2, g2, L2 = elem2
+
+        E = E2 @ E1
+        g = E2 @ g1 + g2
+        L = E2 @ L1 @ E2.T + L2
+
+        return E, g, L
+
+    _, smoothed_means, smoothed_covs, *_ = lax.associative_scan(
+                                                smoothing_operator, initial_elements, reverse=True
+                                                )
+    return {
+        "marginal_loglik": filtered_posterior["marginal_loglik"],
+        "filtered_means": filtered_means,
+        "filtered_covariances": filtered_covs,
+        "smoothed_means": smoothed_means,
+        "smoothed_covariances": smoothed_covs
+    }
+
+def lgssm_log_normalizer(dynamics_params, mu_filtered, Sigma_filtered, potentials):
+    p = dynamics_params
+    Q, A, b = p["Q"][None], p["A"][None], p["b"][None]
+    AT = (p["A"].T)[None]
+
+    I = np.eye(Q.shape[-1])
+
+    Sigma_filtered, mu_filtered = Sigma_filtered[:-1], mu_filtered[:-1]
+    Sigma = Q + A @ Sigma_filtered @ AT
+    mu = (A[0] @ mu_filtered.T).T + b
+    # Append the first element
+    Sigma_pred = np.concatenate([p["Q1"][None], Sigma])
+    mu_pred = np.concatenate([p["m1"][None], mu])
+    mu_rec, Sigma_rec = potentials["mu"], potentials["Sigma"]
+
+    def log_Z_single(mu_pred, Sigma_pred, mu_rec, Sigma_rec):
+        return MVN(loc=mu_pred, covariance_matrix=Sigma_pred+Sigma_rec).log_prob(mu_rec)
+
+    log_Z = vmap(log_Z_single)(mu_pred, Sigma_pred, mu_rec, Sigma_rec)
+    return np.sum(log_Z)
+
+# @title Parallel linear Gaussian state space model object
+def lgssm_log_normalizer(dynamics_params, mu_filtered, Sigma_filtered, potentials):
+    p = dynamics_params
+    Q, A, b = p["Q"][None], p["A"][None], p["b"][None]
+    AT = (p["A"].T)[None]
+
+    I = np.eye(Q.shape[-1])
+
+    Sigma_filtered, mu_filtered = Sigma_filtered[:-1], mu_filtered[:-1]
+    Sigma = Q + A @ Sigma_filtered @ AT
+    mu = (A[0] @ mu_filtered.T).T + b
+    # Append the first element
+    Sigma_pred = np.concatenate([p["Q1"][None], Sigma])
+    mu_pred = np.concatenate([p["m1"][None], mu])
+    mu_rec, Sigma_rec = potentials["mu"], potentials["Sigma"]
+
+    def log_Z_single(mu_pred, Sigma_pred, mu_rec, Sigma_rec):
+        return MVN(loc=mu_pred, covariance_matrix=Sigma_pred+Sigma_rec).log_prob(mu_rec)
+
+    log_Z = vmap(log_Z_single)(mu_pred, Sigma_pred, mu_rec, Sigma_rec)
+    return np.sum(log_Z)
+
+class LinearGaussianSSM(tfd.Distribution):
+    def __init__(self,
+                 initial_mean,
+                 initial_covariance,
+                 dynamics_matrix,
+                 dynamics_bias,
+                 dynamics_noise_covariance,
+                 emissions_means,
+                 emissions_covariances,
+                 log_normalizer,
+                 filtered_means,
+                 filtered_covariances,
+                 smoothed_means,
+                 smoothed_covariances,
+                 smoothed_cross,
+                 validate_args=False,
+                 allow_nan_stats=True,
+                 name="LinearGaussianSSM",
+             ) -> None:
+        # Dynamics
+        self._initial_mean = initial_mean
+        self._initial_covariance = initial_covariance
+        self._dynamics_matrix = dynamics_matrix
+        self._dynamics_bias = dynamics_bias
+        self._dynamics_noise_covariance = dynamics_noise_covariance
+        # Emissions
+        self._emissions_means = emissions_means
+        self._emissions_covariances = emissions_covariances
+        # Filtered
+        self._log_normalizer = log_normalizer
+        self._filtered_means = filtered_means
+        self._filtered_covariances = filtered_covariances
+        # Smoothed
+        self._smoothed_means = smoothed_means
+        self._smoothed_covariances = smoothed_covariances
+        self._smoothed_cross = smoothed_cross
+
+        # We would detect the dtype dynamically but that would break vmap
+        # see https://github.com/tensorflow/probability/issues/1271
+        dtype = np.float32
+        super(LinearGaussianSSM, self).__init__(
+            dtype=dtype,
+            validate_args=validate_args,
+            allow_nan_stats=allow_nan_stats,
+            reparameterization_type=reparameterization.NOT_REPARAMETERIZED,
+            parameters=dict(initial_mean=self._initial_mean,
+                            initial_covariance=self._initial_covariance,
+                            dynamics_matrix=self._dynamics_matrix,
+                            dynamics_bias=self._dynamics_bias,
+                            dynamics_noise_covariance=self._dynamics_noise_covariance,
+                            emissions_means=self._emissions_means,
+                            emissions_covariances=self._emissions_covariances,
+                            log_normalizer=self._log_normalizer,
+                            filtered_means=self._filtered_means,
+                            filtered_covariances=self._filtered_covariances,
+                            smoothed_means=self._smoothed_means,
+                            smoothed_covariances=self._smoothed_covariances,
+                            smoothed_cross=self._smoothed_cross),
+            name=name,
+        )
+
+    @classmethod
+    def _parameter_properties(cls, dtype, num_classes=None):
+        # pylint: disable=g-long-lambda
+        return dict(initial_mean=tfp.internal.parameter_properties.ParameterProperties(event_ndims=1),
+                    initial_covariance=tfp.internal.parameter_properties.ParameterProperties(event_ndims=2),
+                    dynamics_matrix=tfp.internal.parameter_properties.ParameterProperties(event_ndims=2),
+                    dynamics_bias=tfp.internal.parameter_properties.ParameterProperties(event_ndims=1),
+                    dynamics_noise_covariance=tfp.internal.parameter_properties.ParameterProperties(event_ndims=2),
+                    emissions_means=tfp.internal.parameter_properties.ParameterProperties(event_ndims=2),
+                    emissions_covariances=tfp.internal.parameter_properties.ParameterProperties(event_ndims=3),
+                    log_normalizer=tfp.internal.parameter_properties.ParameterProperties(event_ndims=0),
+                    filtered_means=tfp.internal.parameter_properties.ParameterProperties(event_ndims=2),
+                    filtered_covariances=tfp.internal.parameter_properties.ParameterProperties(event_ndims=3),
+                    smoothed_means=tfp.internal.parameter_properties.ParameterProperties(event_ndims=2),
+                    smoothed_covariances=tfp.internal.parameter_properties.ParameterProperties(event_ndims=3),
+                    smoothed_cross=tfp.internal.parameter_properties.ParameterProperties(event_ndims=3)
+        )
+
+    @classmethod
+    def infer_from_dynamics_and_potential(cls, dynamics_params, emissions_potentials):
+        p = dynamics_params
+        mus, Sigmas = emissions_potentials["mu"], emissions_potentials["Sigma"]
+
+        dim = mus.shape[-1]
+        C = np.eye(dim)
+        d = np.zeros(dim)
+
+        params = make_lgssm_params(p["m1"], p["Q1"], p["A"], p["Q"], C, Sigmas, 
+                                   dynamics_bias=p["b"], emissions_bias=d)
+
+        smoothed = lgssm_smoother(params, mus)._asdict()
+        
+        # Compute ExxT
+        A, Q = dynamics_params["A"], dynamics_params["Q"]
+        filtered_cov = smoothed["filtered_covariances"]
+        filtered_mean = smoothed["smoothed_means"]
+        smoothed_cov = smoothed["smoothed_covariances"]
+        smoothed_mean = smoothed["smoothed_means"]
+        G = vmap(lambda C: psd_solve(Q + A @ C @ A.T, A @ C).T)(filtered_cov)
+
+        # Compute the smoothed expectation of z_t z_{t+1}^T
+        smoothed_cross = vmap(
+            lambda Gt, mean, next_mean, next_cov: Gt @ next_cov + np.outer(mean, next_mean))\
+            (G[:-1], smoothed_mean[:-1], smoothed_mean[1:], smoothed_cov[1:])
+
+        log_Z = lgssm_log_normalizer(dynamics_params, 
+                                     smoothed["filtered_means"], 
+                                     smoothed["filtered_covariances"], 
+                                     emissions_potentials)
+
+        return cls(dynamics_params["m1"],
+                   dynamics_params["Q1"],
+                   dynamics_params["A"],
+                   dynamics_params["b"],
+                   dynamics_params["Q"],
+                   emissions_potentials["mu"],
+                   emissions_potentials["Sigma"],
+                   log_Z, # smoothed["marginal_loglik"],
+                   smoothed["filtered_means"],
+                   smoothed["filtered_covariances"],
+                   smoothed["smoothed_means"],
+                   smoothed["smoothed_covariances"],
+                   smoothed_cross)
+        
+    # Properties to get private class variables
+    @property
+    def log_normalizer(self):
+        return self._log_normalizer
+
+    @property
+    def filtered_means(self):
+        return self._filtered_means
+
+    @property
+    def filtered_covariances(self):
+        return self._filtered_covariances
+
+    @property
+    def smoothed_means(self):
+        return self._smoothed_means
+
+    @property
+    def smoothed_covariances(self):
+        return self._smoothed_covariances
+
+    @property
+    def expected_states(self):
+        return self._smoothed_means
+
+    @property
+    def expected_states_squared(self):
+        Ex = self._smoothed_means
+        return self._smoothed_covariances + np.einsum("...i,...j->...ij", Ex, Ex)
+
+    @property
+    def expected_states_next_states(self):
+        return self._smoothed_cross
+
+    def _mean(self):
+        return self.smoothed_means
+
+    def _covariance(self):
+        return self.smoothed_covariances
+    
+    # TODO: currently this function does not depend on the dynamics bias
+    def _log_prob(self, data, **kwargs):
+        A = self._dynamics_matrix #params["A"]
+        Q = self._dynamics_noise_covariance #params["Q"]
+        Q1 = self._initial_covariance #params["Q1"]
+        m1 = self._initial_mean #params["m1"]
+
+        num_batch_dims = len(data.shape) - 2
+
+        ll = np.sum(
+            MVN(loc=np.einsum("ij,...tj->...ti", A, data[...,:-1,:]), 
+                covariance_matrix=Q).log_prob(data[...,1:,:])
+            )
+        ll += MVN(loc=m1, covariance_matrix=Q1).log_prob(data[...,0,:])
+
+        # Add the observation potentials
+        # ll += - 0.5 * np.einsum("...ti,tij,...tj->...", data, self._emissions_precisions, data) \
+        #       + np.einsum("...ti,ti->...", data, self._emissions_linear_potentials)
+        ll += np.sum(MVN(loc=self._emissions_means, 
+                  covariance_matrix=self._emissions_covariances).log_prob(data), axis=-1)
+        # Add the log normalizer
+        ll -= self._log_normalizer
+
+        return ll
+
+    def _sample_n(self, n, seed=None):
+
+        F = self._dynamics_matrix
+        b = self._dynamics_bias
+        Q = self._dynamics_noise_covariance
+        
+        def sample_single(
+            key,
+            filtered_means,
+            filtered_covariances
+        ):
+
+            initial_elements = _make_associative_sampling_elements(
+                { "A": F, "b": b, "Q": Q }, key, filtered_means, filtered_covariances)
+
+            @vmap
+            def sampling_operator(elem1, elem2):
+                E1, h1 = elem1
+                E2, h2 = elem2
+
+                E = E2 @ E1
+                h = E2 @ h1 + h2
+                return E, h
+
+            _, sample = \
+                lax.associative_scan(sampling_operator, initial_elements, reverse=True)
+                
+            return sample
+
+        # TODO: Handle arbitrary batch shapes
+        if self._filtered_covariances.ndim == 4:
+            # batch mode
+            samples = vmap(vmap(sample_single, in_axes=(None, 0, 0)), in_axes=(0, None, None))\
+                (jr.split(seed, n), self._filtered_means, self._filtered_covariances)
+            # Transpose to be (num_samples, num_batches, num_timesteps, dim)
+            # samples = np.transpose(samples, (1, 0, 2, 3))
+        else:
+            # non-batch mode
+            samples = vmap(sample_single, in_axes=(0, None, None))\
+                (jr.split(seed, n), self._filtered_means, self._filtered_covariances)
+        return samples
+
+    def _entropy(self):
+        """
+        Compute the entropy
+
+            H[X] = -E[\log p(x)]
+                 = -E[-1/2 x^T J x + x^T h - log Z(J, h)]
+                 = 1/2 <J, E[x x^T] - <h, E[x]> + log Z(J, h)
+        """
+        Ex = self.expected_states
+        ExxT = self.expected_states_squared
+        ExnxT = self.expected_states_next_states
+        p = dynamics_to_tridiag(
+            {
+                "m1": self._initial_mean,
+                "Q1": self._initial_covariance,
+                "A": self._dynamics_matrix,
+                "b": self._dynamics_bias,
+                "Q": self._dynamics_noise_covariance,
+            }, Ex.shape[0], Ex.shape[1]
+        )
+        J_diag = p["J"] + solve(self._emissions_covariances, np.eye(Ex.shape[-1])[None])
+        J_lower_diag = p["L"]
+
+        Sigmatt = ExxT - np.einsum("ti,tj->tij", Ex, Ex)
+        Sigmatnt = ExnxT - np.einsum("ti,tj->tji", Ex[:-1], Ex[1:])
+
+        entropy = 0.5 * np.sum(J_diag * Sigmatt)
+        entropy += np.sum(J_lower_diag * Sigmatnt)
+        return entropy - self.log_prob(Ex)
+
+class ParallelLinearGaussianSSM(LinearGaussianSSM):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs["name"] = "ParallelLinearGaussianSSM"
+        super().__init__(*args, **kwargs)
+
+    @classmethod
+    def infer_from_dynamics_and_potential(cls, dynamics_params, emissions_potentials):
+        # p = dynamics_params
+        # mus, Sigmas = emissions_potentials["mu"], emissions_potentials["Sigma"]
+
+        # dim = mus.shape[-1]
+        # C = np.eye(dim)
+        # d = np.zeros(dim)
+
+        smoothed = parallel_lgssm_smoother(dynamics_params, emissions_potentials)
+        
+        # Compute ExxT
+        A, Q = dynamics_params["A"], dynamics_params["Q"]
+        filtered_cov = smoothed["filtered_covariances"]
+        filtered_mean = smoothed["smoothed_means"]
+        smoothed_cov = smoothed["smoothed_covariances"]
+        smoothed_mean = smoothed["smoothed_means"]
+        G = vmap(lambda C: psd_solve(Q + A @ C @ A.T, A @ C).T)(filtered_cov)
+
+        # Compute the smoothed expectation of z_t z_{t+1}^T
+        smoothed_cross = vmap(
+            lambda Gt, mean, next_mean, next_cov: Gt @ next_cov + np.outer(mean, next_mean))\
+            (G[:-1], smoothed_mean[:-1], smoothed_mean[1:], smoothed_cov[1:])
+
+        log_Z = lgssm_log_normalizer(dynamics_params, 
+                                     smoothed["filtered_means"], 
+                                     smoothed["filtered_covariances"], 
+                                     emissions_potentials)
+
+        return cls(dynamics_params["m1"],
+                   dynamics_params["Q1"],
+                   dynamics_params["A"],
+                   dynamics_params["b"],
+                   dynamics_params["Q"],
+                   emissions_potentials["mu"],
+                   emissions_potentials["Sigma"],
+                   log_Z, # smoothed["marginal_loglik"],
+                   smoothed["filtered_means"],
+                   smoothed["filtered_covariances"],
+                   smoothed["smoothed_means"],
+                   smoothed["smoothed_covariances"],
+                   smoothed_cross)
+
+# @title Parallel versions of the same priors and posteriors
+
+# Super simple because all the machinary is already taken care of
+class LDSSVAEPosterior(SVAEPrior):
+    def __init__(self, latent_dims, seq_len, use_parallel=False):
+        self.latent_dims = latent_dims
+        # The only annoying thing is that we have to specify the sequence length
+        # ahead of time
+        self.seq_len = seq_len
+        self.dist = ParallelLinearGaussianSSM if use_parallel else LinearGaussianSSM
+
+    @property
+    def shape(self):
+        return (self.seq_len, self.latent_dims)
+
+    # Must be the full set of constrained parameters!
+    def distribution(self, p):
+        m1, Q1, A, b, Q, mus, Sigmas = p["m1"], p["Q1"], p["A"], p["b"], p["Q"], p["mu"], p["Sigma"]
+        log_Z, mu_filtered, Sigma_filtered = p["log_Z"], p["mu_filtered"], p["Sigma_filtered"]
+        mu_smoothed, Sigma_smoothed, ExnxT = p["mu_smoothed"], p["Sigma_smoothed"], p["ExnxT"]
+        return self.dist(m1, Q1, A, b, Q, mus, Sigmas, 
+                             log_Z, mu_filtered, Sigma_filtered, 
+                             mu_smoothed, Sigma_smoothed, ExnxT)
+
+    def init(self, key):
+        T, D = self.seq_len, self.latent_dims
+        key_A, key = jr.split(key, 2)
+        p = {
+            "m1": np.zeros(D),
+            "Q1": np.eye(D),
+            "A": random_rotation(key_A, D, theta=np.pi/20),
+            "b": np.zeros(D),
+            "Q": np.eye(D),
+            "Sigma": np.tile(np.eye(D)[None], (T, 1, 1)),
+            "mu": np.zeros((T, D))
+        }
+
+        dist = self.dist.infer_from_dynamics_and_potential(p, 
+                                    {"mu": p["mu"], "Sigma": p["Sigma"]})
+        
+        p.update({
+            "log_Z": dist.log_normalizer,
+            "mu_filtered": dist.filtered_means,
+            "Sigma_filtered": dist.filtered_covariances,
+            "mu_smoothed": dist.smoothed_means,
+            "Sigma_smoothed": dist.smoothed_covariances,
+            "ExnxT": dist.expected_states_next_states
+        })
+        return p
+
+    def get_dynamics_params(self, params):
+        return params
+
+    def infer(self, prior_params, potential_params):
+        p = {
+            "m1": prior_params["m1"],
+            "Q1": prior_params["Q1"],
+            "A": prior_params["A"],
+            "b": prior_params["b"],
+            "Q": prior_params["Q"],
+            "Sigma": potential_params["Sigma"],
+            "mu": potential_params["mu"]
+        }
+
+        dist = self.dist.infer_from_dynamics_and_potential(prior_params, 
+                                    {"mu": p["mu"], "Sigma": p["Sigma"]})
+        p.update({
+            "log_Z": dist.log_normalizer,
+            "mu_filtered": dist.filtered_means,
+            "Sigma_filtered": dist.filtered_covariances,
+            "mu_smoothed": dist.smoothed_means,
+            "Sigma_smoothed": dist.smoothed_covariances,
+            "ExnxT": dist.expected_states_next_states
+        })
+        return p
+
+    def get_constrained_params(self, params):
+        p = copy.deepcopy(params)
+        return p
 
 """## Define neural network architectures"""
 
@@ -1362,18 +2214,20 @@ class DCNN(nn.Module):
 # @title Potential networks (outputs potentials on single observations)
 class PotentialNetwork(nn.Module):
     def __call__(self, inputs):
-        J, h = self._generate_distribution_parameters(inputs)
-        if (len(J.shape) == 3):
-            seq_len, latent_dims, _ = J.shape
-            # lower diagonal blocks of precision matrix
-            L = np.zeros((seq_len-1, latent_dims, latent_dims))
-        elif (len(J.shape) == 4):
-            batch_size, seq_len, latent_dims, _ = J.shape
-            # lower diagonal blocks of precision matrix
-            L = np.zeros((batch_size, seq_len-1, latent_dims, latent_dims))
-        else:
-            L = np.zeros(tuple())
-        return {"J": J, "L": L, "h": h}
+        Sigma, mu = self._generate_distribution_parameters(inputs)
+        # J, h = solve(Sigma, np.eye(mu.shape[-1])[None]), solve(Sigma, mu)
+        # if (len(J.shape) == 3):
+        #     seq_len, latent_dims, _ = J.shape
+        #     # lower diagonal blocks of precision matrix
+        #     L = np.zeros((seq_len-1, latent_dims, latent_dims))
+        # elif (len(J.shape) == 4):
+        #     batch_size, seq_len, latent_dims, _ = J.shape
+        #     # lower diagonal blocks of precision matrix
+        #     L = np.zeros((batch_size, seq_len-1, latent_dims, latent_dims))
+        # else:
+        #     L = np.zeros(tuple())
+        return {#"J": J, "L": L, "h": h, 
+                "Sigma": Sigma, "mu": mu}
 
     def _generate_distribution_parameters(self, inputs):
         if (len(inputs.shape) == self.input_rank + 2):
@@ -1440,17 +2294,17 @@ class GaussianRecognition(PotentialNetwork):
             Sigma = np.diag(softplus(var_output_flat) + self.eps)
         else:
             Sigma = lie_params_to_constrained(var_output_flat, self.latent_dims, self.eps)
-        h = np.linalg.solve(Sigma, mu)
-        J = np.linalg.inv(Sigma)
+        # h = np.linalg.solve(Sigma, mu)
+        # J = np.linalg.inv(Sigma)
         # lower diagonal blocks of precision matrix
-        return (J, h)
+        return (Sigma, mu)
 
 # @title Posterior networks (outputs full posterior for entire sequence)
 # Outputs Gaussian distributions for the entire sequence at once
 class PosteriorNetwork(PotentialNetwork):
     def __call__(self, inputs):
-        J, L, h = self._generate_distribution_parameters(inputs)
-        return {"J": J, "L": L, "h": h}
+        As, bs, Qs = self._generate_distribution_parameters(inputs)
+        return {"As": As, "bs": bs, "Qs": Qs}
 
     def _generate_distribution_parameters(self, inputs):
         is_batched = (len(inputs.shape) == self.input_rank+2)
@@ -1516,38 +2370,6 @@ class GaussianBiRNN(PosteriorNetwork):
 
     # Applied the BiRNN to a single sequence of inputs
     def _call_single(self, inputs):
-
-        output_dim = self.output_dim
-        
-        inputs = vmap(self.input_fn)(inputs)
-        init_carry_forward = np.zeros((self.rnn_dim,))
-        _, out_forward = self.forward_RNN(init_carry_forward, inputs)
-        init_carry_backward = np.zeros((self.rnn_dim,))
-        _, out_backward = self.backward_RNN(init_carry_backward, inputs)
-        # Concatenate the forward and backward outputs
-        out_combined = np.concatenate([out_forward, out_backward], axis=-1)
-        
-        # Get the mean.
-        # vmap over the time dimension
-        mu = vmap(self.head_mean_fn)(out_combined)
-        # Get the variance output and reshape it.
-        # vmap over the time dimension
-        var_output_flat = vmap(self.head_log_var_fn)(out_combined)
-        Sigma = vmap(lie_params_to_constrained, in_axes=(0, None, None))\
-            (var_output_flat, output_dim, self.eps)
-
-        h = vmap(np.linalg.solve, in_axes=(0, 0))(Sigma, mu)
-        J = np.linalg.inv(Sigma)
-
-        seq_len = J.shape[0]
-        # lower diagonal blocks of precision matrix
-        L = np.zeros((seq_len-1, output_dim, output_dim))
-        return (J, L, h)
-
-# Also uses the mean parameterization
-class ConditionalGaussianBiRNN(GaussianBiRNN):
-    # Applied the BiRNN to a single sequence of inputs
-    def _call_single(self, inputs):
         output_dim = self.output_dim
         
         inputs = vmap(self.input_fn)(inputs)
@@ -1565,26 +2387,12 @@ class ConditionalGaussianBiRNN(GaussianBiRNN):
         # Get the variance output and reshape it.
         # vmap over the time dimension
         var_output_flat = vmap(self.head_log_var_fn)(out_combined)
-
-        # Here we could just parameterize Q_inv instead of Q
-        # but we parameterize Q to be more in line with the SVAE recognition
-        # which empirically works better with mean instead of natural parameterization
         Q = vmap(lie_params_to_constrained, in_axes=(0, None, None))\
             (var_output_flat, output_dim, self.eps)
-        Q_inv = inv(Q)
-
         dynamics_flat = vmap(self.head_dyn_fn)(out_combined)
         A = dynamics_flat.reshape((-1, output_dim, output_dim))
 
-        L_diag = np.einsum("til,tlj->tij", -Q_inv[1:], A[1:])
-        ATQinvA = np.einsum("tji,tjl,tlk->tik", A[1:], Q_inv[1:], A[1:])
-        ATQinvb = np.einsum("tli,tlj,tj->ti", A[1:], Q_inv[1:], b[1:])
-        # Here the J matrices are full matrices
-        J_diag = Q_inv.at[:-1].add(ATQinvA)
-
-        h = np.einsum("tij,tj->ti", Q_inv, b).at[:-1].add(ATQinvb)
-
-        return (J_diag, L_diag, h)
+        return (A, b, Q)
 
 # @title Special architectures for PlaNet
 class PlaNetRecognitionWrapper:
@@ -1597,7 +2405,7 @@ class PlaNetRecognitionWrapper:
     def apply(self, params, x):
         return {
             "network_input": self.rec_net.apply(params["rec_params"], x)["h"],
-            "network_params": params["post_params"] 
+            "network_params": params["post_params"],
         }
 
 class StochasticRNNCell(nn.Module):
@@ -1683,7 +2491,9 @@ class GaussianDCNNEmission(PotentialNetwork):
     def _call_single(self, x):
         out_raw = self.network(x)
         mu_raw, sigma_raw = np.split(out_raw, 2, axis=-1)
-        mu = sigmoid(mu_raw)
+        # Get rid of the Sigmoid
+        # mu = sigmoid(mu_raw)
+        mu = mu_raw
         sigma = softplus(sigma_raw)
         # sigma = np.ones_like(mu) * 0.1
         return { "mu": mu, "sigma": sigma }
@@ -1705,15 +2515,20 @@ def random_projection(seed, N):
     return np.stack([v1, v2])
 
 def get_gaussian_draw_params(mu, Sigma, proj_seed=None):
+
+    Sigma = (Sigma + Sigma.T) * .5
+
     if (mu.shape[0] > 2):
         P = random_projection(proj_seed, mu.shape[0])
         mu = P @ mu
-        Sigma = P @ Sigma @ P.T
     angles = np.hstack([np.arange(0, 2*np.pi, 0.01), 0])
     circle = np.vstack([np.sin(angles), np.cos(angles)])
     min_eig = np.min(eigh(Sigma)[0])
-    if (min_eig <= 0): Sigma += 1e-4-np.eye(Sigma.shape[0]) * min_eig
-    ellipse = np.dot(2 * np.linalg.cholesky(Sigma), circle)
+    eps = 1e-6
+    if (min_eig <= eps): Sigma += np.eye(Sigma.shape[0]) * eps
+    L = np.linalg.cholesky(Sigma)
+    u, svs, vt = svd(P @ L)
+    ellipse = np.dot(u * svs, circle) * 2
     return (mu[0], mu[1]), (ellipse[0, :] + mu[0], ellipse[1, :] + mu[1])
 
 def plot_gaussian_2D(mu, Sigma, proj_seed=None, ax=None, **kwargs):
@@ -1844,7 +2659,9 @@ def get_marginals_and_targets(seed, data, num_points, model,
         (true_model_params, data[trials])
     true_mus, true_Sigmas = vmap(gaussian_posterior_mean_and_cov)(true_post_params, times)
 
-    model_lds = LDS(model.prior.latent_dims, T, base=model.prior)
+    # TODO: this is temporary! Only for testing parallel KF!
+    base = LieParameterizedLinearGaussianChainPrior(model.prior.latent_dims, T)
+    model_lds = LDS(model.prior.latent_dims, T, base=base)
 
     for i in range(len(past_params)):
         model_params = past_params[i]
@@ -1868,9 +2685,35 @@ def get_marginals_and_targets(seed, data, num_points, model,
         tgt_Sigmas.append(Sigmas)
     return inf_mus, inf_Sigmas, tgt_mus, tgt_Sigmas, true_mus, true_Sigmas
 
+# Trying to figure out the proper way of plotting the projection
+# Of high dimensional Gaussians
+# key = jr.split(key)[1]
+# dim = 5
+# Q = jr.uniform(key, shape=(dim, dim))
+# A = Q @ Q.T
+# L = cholesky(A)
+# P = random_projection(key_0, dim)
+# plot_gaussian_2D(np.zeros(dim), A, key_0)
+# points = jr.normal(key_0, (400, dim))
+# points /= np.sum(points ** 2, axis=1, keepdims=True) ** .5
+# points = P @ L @ points.T
+# plt.scatter(points[0, :], points[1, :], s=1)
+# u, svs, vt = svd(P @ L)
+# plt.scatter(u[0][0] * svs[0], u[1][0] * svs[0])
+# plt.scatter(u[0][1] * svs[1], u[1][1] * svs[1])
+# # plt.scatter(u[0][0] * np.sqrt(svs[0]), u[1][0] * np.sqrt(svs[0]))
+# # plt.scatter(u[0][1] * svs[1], u[1][1] * svs[1])
+# # P = random_projection(key_0, 3)
+# angles = np.hstack([np.arange(0, 2*np.pi, 0.01), 0])
+# circle = np.vstack([np.sin(angles), np.cos(angles)])
+# ellipse = np.dot(u * svs, circle) * 2
+# plt.plot(ellipse[0,:], ellipse[1,:])
+
 """## Define training loop"""
 
 # @title Trainer object 
+from time import time
+
 class Trainer:
     """
     model: a pytree node
@@ -1892,6 +2735,7 @@ class Trainer:
         self.params = initial_params
         self.model = model
         self.past_params = []
+        self.time_spent = []
 
         if train_params is None:
             train_params = dict()
@@ -1976,9 +2820,16 @@ class Trainer:
             batch_id = itr % num_batches
             batch_start = batch_id * batch_size
 
-            self.params, self.opt_states, loss_out, grads = \
-                train_step(train_key, self.params, 
+            # t = time()
+            # Training step
+            # ----------------------------------------
+            step_results = train_step(train_key, self.params, 
                            train_data[batch_start:batch_start+batch_size], self.opt_states)
+            self.params, self.opt_states, loss_out, grads = step_results#\
+                # jax.tree_map(lambda x: x.block_until_ready(), step_results)
+            # ----------------------------------------
+            # dt = time() - t
+            # self.time_spent.append(dt)
 
             loss, aux = loss_out
             self.train_losses.append(loss)
@@ -2021,7 +2872,7 @@ class Trainer:
                 val_step = jit(self.val_step)
 
         if summary:
-            summary(self)
+            summary(self, data_dict)
 
 # @title Logging to WandB
 
@@ -2146,8 +2997,8 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
 
     itr = len(trainer.train_losses) - 1
     if len(trainer.train_losses) == 1:
-        wandb.init(project=project_name, group=group_name, config=p,
-        	dir="/scratch/users/yixiuz/")
+        wandb.init(project=project_name, group=group_name, config=p,    
+            dir="/scratch/users/yixiuz/")
         pprint(p)
 
     obj, aux = loss_out
@@ -2179,9 +3030,9 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
 
     visualizations = {}
     if (itr % p["plot_interval"] == 0):
-        if p["dataset"] == "lds":
+        if p["dataset"] == "lds" and p.get("visualize_training"):
             visualizations = visualize_lds(trainer, data_dict, aux)
-        elif p["dataset"] == "pendulum":
+        elif p["dataset"] == "pendulum" and p.get("visualize_training"):
             visualizations = visualize_pendulum(trainer, aux)
 
         fig = plt.figure()
@@ -2205,7 +3056,7 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
     to_log.update(visualizations)
     wandb.log(to_log)
 
-def save_params_to_wandb(trainer):
+def save_params_to_wandb(trainer, data_dict):
     file_name = "parameters.pkl"
     with open(file_name, "wb") as f:
         pkl.dump(trainer.past_params, f)
@@ -2213,6 +3064,133 @@ def save_params_to_wandb(trainer):
 
 def on_error(data_dict, model_dict):
     save_params_to_wandb(model_dict["trainer"])
+
+# @title Summary functions
+
+def predict_multiple(run_params, model_params, model, data, T, key, num_samples=100):
+    """
+    Returns:
+        Posterior mean (T, D)
+        Posterior covariance (T, D, D)
+        Predictions (N, T//2, D)
+        Expected prediction log likelihood (lower bound of MLL) (T//2, D)
+    """
+    seq_len = model.prior.seq_len
+    D = model.prior.latent_dims
+    model.prior.seq_len = T
+    model.posterior.seq_len = T
+
+    out = model.elbo(key, data[:T], model_params, **run_params)
+    post_params = out["posterior_params"]
+    posterior = model.posterior.distribution(post_params)
+    
+    # Get the final mean and covariance
+    post_mean, post_covariance = posterior.mean, posterior.covariance
+    mu, Sigma = post_mean[T-1], post_covariance[T-1]
+    # Build the posterior object on the future latent states 
+    # ("the posterior predictive distribution")
+    # Convert unconstrained params to constrained dynamics parameters
+    dynamics = model.prior.get_dynamics_params(model_params["prior_params"])
+    pred_posterior = LinearGaussianChain.from_stationary_dynamics(
+        mu, Sigma, dynamics["A"], dynamics["b"], dynamics["Q"], seq_len-T+1) # Note the +1
+
+    # Sample from it and evaluate the log likelihood
+    x_preds = pred_posterior.sample(seed=key, sample_shape=(num_samples,))
+
+    def pred_ll(x_pred):
+        likelihood_dist = model.decoder.apply(model_params["dec_params"], x_pred)
+        return likelihood_dist.log_prob(data[T:])
+
+    pred_lls = vmap(pred_ll)(x_preds[:,1:])
+    # This assumes the pendulum dataset
+    # Which has 3d observations (width, height, channels)
+    pred_lls = pred_lls.sum(axis=(2, 3, 4))
+    # We want to estimate \log p_tilde(y2|y1) = \log \int p(y2|x2) q(x2|y1) dx2
+    # ~ \log E_q(x2|y1)[p(y2|x2)] 
+    # So instead of mean we compute the logsumexp
+    pred_lls = logsumexp(pred_lls, axis=0) - np.log(num_samples)
+    
+    # Revert the model sequence length
+    model.prior.seq_len = seq_len
+    model.posterior.seq_len = seq_len
+
+    # Keep only the first 10 samples
+    return post_mean, post_covariance, x_preds[:10], pred_lls
+
+def get_latents_and_predictions(run_params, model_params, model, data_dict):
+    
+    key = jr.PRNGKey(42)
+
+    # Try to decode true states linearly from model encodings
+    num_predictions = 10
+    num_examples = 20
+    num_frames = 100
+
+    def encode(data):
+        out = model.elbo(jr.PRNGKey(0), data, model_params, **run_params)
+        post_params = out["posterior_params"]
+        post_dist = model.posterior.distribution(post_params)
+        return post_dist.mean, post_dist.covariance
+
+    train_data = data_dict["train_data"][:,:num_frames]
+    Ex, _ = vmap(encode)(train_data)
+    # Figure out the linear regression weights which decodes true states
+    states = data_dict["train_states"][:]
+    # states = targets[:,::2] # We subsampled the data during training to make pendulum swing faster
+    # Compute the true angles and angular velocities
+    train_thetas = np.arctan2(states[:,:,0], states[:,:,1])
+    train_omegas = train_thetas[:,1:]-train_thetas[:,:-1]
+    thetas = train_thetas.flatten()
+    omegas = train_omegas.flatten()
+    # Fit the learned representations to the true states
+    D = model.prior.latent_dims
+    xs_theta = Ex.reshape((-1, D))
+    xs_omega = Ex[:,1:].reshape((-1, D))
+    W_theta, _, _, _ = np.linalg.lstsq(xs_theta, thetas)
+    W_omega, _, _, _ = np.linalg.lstsq(xs_omega, omegas)
+
+    # Evaluate mse on test data
+    test_states = data_dict["val_states"][:, :num_frames]
+    test_data = data_dict["val_data"][:, :num_frames]
+    thetas = np.arctan2(test_states[:,:,0], test_states[:,:,1])
+    omegas = thetas[:,1:]-thetas[:,:-1]
+
+    partial_mean, partial_cov, test_preds, test_pred_lls = vmap(predict_multiple, 
+        in_axes=(None, None, None, 0, None, None, None))\
+        (run_params, model_params, model, test_data, num_frames//2, key, num_predictions)
+    test_mean, test_cov = vmap(encode)(test_data)
+    pred_thetas = np.einsum("i,...i->...", W_theta, test_mean)
+    theta_mse = np.mean((pred_thetas - thetas) ** 2)
+    pred_omegas = np.einsum("i,...i->...", W_omega, test_mean[:,1:])
+    omega_mse = np.mean((pred_omegas - omegas) ** 2)
+
+    return {
+        "latent_mean": test_mean,
+        "latent_covariance": test_cov,
+        "latent_mean_partial": partial_mean,
+        "latent_covariance_partial": partial_cov,
+        "prediction_lls": test_pred_lls,
+        "predictions": test_preds,
+        "w_theta": W_theta,
+        "w_omega": W_omega,
+        "theta_mse": theta_mse,
+        "omega_mse": omega_mse,
+    }
+
+def summarize_pendulum_run(trainer, data_dict):
+    file_name = "parameters.pkl"
+    with open(file_name, "wb") as f:
+        pkl.dump(trainer.past_params, f)
+        wandb.save(file_name, policy="now")
+    # Compute predictions on test set
+    # Set the mask size to 0 for summary!!
+    run_params = deepcopy(trainer.train_params)
+    run_params["mask_size"] = 0
+    results = get_latents_and_predictions(
+        run_params, trainer.params, trainer.model, data_dict)
+    file_name = "results.npy"
+    np.save(file_name, results, allow_pickle=True)
+    wandb.save(file_name, policy="now")
 
 # @title Specifics of SVAE training
 def svae_init(key, model, data, initial_params=None, **train_params):
@@ -2253,7 +3231,7 @@ def svae_init(key, model, data, initial_params=None, **train_params):
 def svae_loss(key, model, data_batch, model_params, **train_params):
     batch_size = data_batch.shape[0]
     # Axes specification for vmap
-    # For purposes of this work (AISTATS), we're just going to ignore this
+    # We're just going to ignore this for now
     params_in_axes = None
     # params_in_axes = dict.fromkeys(model_params.keys(), None)
     # params_in_axes["post_samples"] = 0
@@ -2262,11 +3240,12 @@ def svae_loss(key, model, data_batch, model_params, **train_params):
     objs = result["objective"]
     post_params = result["posterior_params"]
     post_samples = result["posterior_samples"]
-
-    post_suff_stats = vmap(model.posterior.sufficient_statistics)(post_params)
-    expected_post_suff_stats = tree_map(
-        lambda l: np.mean(l,axis=0), post_suff_stats)
-    result["sufficient_statistics"] = expected_post_suff_stats
+    # Need to compute sufficient stats if we want the natural gradient update
+    if (train_params.get("use_natural_grad")):
+        post_suff_stats = vmap(model.posterior.sufficient_statistics)(post_params)
+        expected_post_suff_stats = tree_map(
+            lambda l: np.mean(l,axis=0), post_suff_stats)
+        result["sufficient_statistics"] = expected_post_suff_stats
     return -np.mean(objs), result
 
 def predict_forward(x, A, b, T):
@@ -2291,45 +3270,39 @@ def svae_val_loss(key, model, data_batch, model_params, **train_params):
     # under the posterior given the current set of observations
     # So E_{q(x'|y)}[p(y'|x')] where the primes represent the future
     post_params = out_dict["posterior_params"]
-
-    posterior = model.posterior.distribution(post_params)
-    # J = posterior.filtered_precisions
-    # h = posterior.filtered_linear_potentials
-    Sigma_filtered = posterior.filtered_covariances # inv(J)
-    mu_filtered = posterior.filtered_means # np.einsum("...ij,...j->...i", Sigma_filtered, h)
     horizon = train_params["prediction_horizon"] or 5
 
-    def _prediction_lls(data_id, key):
-        num_windows = T-horizon-1
-        pred_lls = vmap(_sliding_window_prediction_lls, in_axes=(None, None, None, 0, 0))(
-            mu_filtered[data_id], Sigma_filtered[data_id], obs_data[data_id],
-            np.arange(num_windows), jr.split(key, num_windows))
-        return pred_lls.mean()
+    # def _prediction_lls(data_id, key):
+    #     num_windows = T-horizon-1
+    #     pred_lls = vmap(_sliding_window_prediction_lls, in_axes=(None, None, None, 0, 0))(
+    #         mu_filtered[data_id], Sigma_filtered[data_id], obs_data[data_id],
+    #         np.arange(num_windows), jr.split(key, num_windows))
+    #     return pred_lls.mean()
 
-    def _sliding_window_prediction_lls(mu, Sigma, data, t, key):
-        # Build the posterior object on the future latent states 
-        # ("the posterior predictive distribution")
-        # Convert unconstrained params to constrained dynamics parameters
-        prior_params_constrained = model.prior.get_dynamics_params(prior_params)
-        dynamics_params = {
-            "m1": mu[t],
-            "Q1": Sigma[t],
-            "A": prior_params_constrained["A"],
-            "b": prior_params_constrained["b"],
-            "Q": prior_params_constrained["Q"]
-        }
-        tridiag_params = dynamics_to_tridiag(dynamics_params, horizon+1, D) # Note the +1
-        J, L, h = tridiag_params["J"], tridiag_params["L"], tridiag_params["h"]
-        pred_posterior = MultivariateNormalBlockTridiag.infer(J, L, h)
-        # Sample from it and evaluate the log likelihood
-        x_pred = pred_posterior.sample(seed=key)[1:]
-        likelihood_dist = model.decoder.apply(model_params["dec_params"], x_pred)
-        return likelihood_dist.log_prob(
-            lax.dynamic_slice(data, (t+1, 0, 0, 0), (horizon,) + data.shape[1:])).sum(axis=(1, 2, 3))
-
-    # pred_lls = vmap(_prediction_lls)(
-    #     out_dict["posterior_params"], data_batch, jr.split(key, N))
-    pred_lls = vmap(_prediction_lls)(np.arange(N), jr.split(key, N))
+    # # TODO: change this...!
+    # def _sliding_window_prediction_lls(mu, Sigma, data, t, key):
+    #     # Build the posterior object on the future latent states 
+    #     # ("the posterior predictive distribution")
+    #     # Convert unconstrained params to constrained dynamics parameters
+    #     prior_params_constrained = model.prior.get_dynamics_params(prior_params)
+    #     dynamics_params = {
+    #         "m1": mu[t],
+    #         "Q1": Sigma[t],
+    #         "A": prior_params_constrained["A"],
+    #         "b": prior_params_constrained["b"],
+    #         "Q": prior_params_constrained["Q"]
+    #     }
+    #     tridiag_params = dynamics_to_tridiag(dynamics_params, horizon+1, D) # Note the +1
+    #     J, L, h = tridiag_params["J"], tridiag_params["L"], tridiag_params["h"]
+    #     pred_posterior = MultivariateNormalBlockTridiag.infer(J, L, h)
+    #     # Sample from it and evaluate the log likelihood
+    #     x_pred = pred_posterior.sample(seed=key)[1:]
+    #     likelihood_dist = model.decoder.apply(model_params["dec_params"], x_pred)
+    #     return likelihood_dist.log_prob(
+    #         lax.dynamic_slice(data, (t+1, 0, 0, 0), (horizon,) + data.shape[1:])).sum(axis=(1, 2, 3))
+    _, _, _, pred_lls = vmap(predict_multiple, in_axes=(None, None, None, 0, None, 0, None))\
+        (train_params, model_params, model, obs_data, T-horizon, jr.split(key, N), 10)
+    # pred_lls = vmap(_prediction_lls)(np.arange(N), jr.split(key, N))
     out_dict["prediction_ll"] = pred_lls
     return obj, out_dict
 
@@ -2370,7 +3343,8 @@ def svae_update(params, grads, opts, opt_states, model, aux, **train_params):
 
         if (train_params.get("constrain_dynamics")):
             # Scale A so that its maximum singular value does not exceed 1
-            params["prior_params"]["A"] = scale_singular_values(params["prior_params"]["A"])
+            params["prior_params"]["A"] = truncate_singular_values(params["prior_params"]["A"])
+            # params["prior_params"]["A"] = scale_singular_values(params["prior_params"]["A"])
 
     return params, (rec_opt_state, dec_opt_state, prior_opt_state)
 
@@ -2389,13 +3363,18 @@ def init_model(run_params, data_dict):
     recnet_class = globals()[p["recnet_class"]]
     decnet_class = globals()[p["decnet_class"]]
 
-    if p["inference_method"] in ["cdkf", "dkf"]:
+    if p["inference_method"] == "dkf":
         posterior = DKFPosterior(latent_dims, num_timesteps)
+    elif p["inference_method"] == "cdkf":
+        posterior = CDKFPosterior(latent_dims, num_timesteps)
     elif p["inference_method"] == "planet":
         posterior = PlaNetPosterior(p["posterior_architecture"],
                                     latent_dims, num_timesteps)
     elif p["inference_method"] == "svae":
-        posterior = LDSSVAEPosterior(latent_dims, num_timesteps)
+        # The parallel Kalman stuff only applies to SVAE
+        # Since RNN based methods are inherently sequential
+        posterior = LDSSVAEPosterior(latent_dims, num_timesteps, 
+                                     use_parallel=p.get("use_parallel_kf"))
         
     rec_net = recnet_class.from_params(**p["recnet_architecture"])
     dec_net = decnet_class.from_params(**p["decnet_architecture"])
@@ -2404,9 +3383,9 @@ def init_model(run_params, data_dict):
         rec_net = PlaNetRecognitionWrapper(rec_net)
 
     if (p.get("use_natural_grad")):
-        prior = LinearGaussianChain(latent_dims, num_timesteps)
+        prior = LinearGaussianChainPrior(latent_dims, num_timesteps)
     else:
-        prior = LieParameterizedLinearGaussianChain(latent_dims, num_timesteps)
+        prior = LieParameterizedLinearGaussianChainPrior(latent_dims, num_timesteps)
 
     model = DeepLDS(
         recognition=rec_net,
@@ -2462,11 +3441,18 @@ def init_model(run_params, data_dict):
 
 def start_trainer(model_dict, data_dict, run_params):
     trainer = model_dict["trainer"]
+    if run_params.get("log_to_wandb"):
+        if run_params["dataset"] == "pendulum":
+            summary = summarize_pendulum_run
+        else:
+            summary = save_params_to_wandb
+    else:
+        summary = None
     trainer.train(data_dict,
                   max_iters=run_params["max_iters"],
                   key=run_params["seed"],
                   callback=log_to_wandb, val_callback=validation_log_to_wandb,
-                  summary=save_params_to_wandb)
+                  summary=summary)
     return (trainer.model, trainer.params, trainer.train_losses)
 
 """## Load datasets"""
@@ -2480,6 +3466,9 @@ def sample_lds_dataset(run_params):
         and "dataset_params" in data_dict \
         and str(data_dict["dataset_params"]) == str(fd.freeze(d)):
         print("Using existing data.")
+        print("Data MLL: ", data_dict["marginal_log_likelihood"])
+        
+        # return jax.device_put(data_dict, jax.devices("gpu")[0])
         return data_dict
 
     data_dict = {}
@@ -2500,6 +3489,7 @@ def sample_lds_dataset(run_params):
 
     # Here we let Q1 = Q
     lds = LDS(latent_dims, num_timesteps)
+    
     params = {
             "m1": jr.normal(key=seed_m1, shape=(latent_dims,)),
             "Q1": Q,
@@ -2518,11 +3508,11 @@ def sample_lds_dataset(run_params):
     states, data = lds.sample(params, 
                               shape=(num_trials,), 
                               key=seed_sample)
+    
     mll = vmap(lds.marginal_log_likelihood, in_axes=(None, 0))(params, data)
     mll = np.mean(mll, axis=0)
     print("Data MLL: ", mll)
     
-
     seed_val, _ = jr.split(seed_sample)
     val_states, val_data = lds.sample(params, 
                               shape=(num_trials,), 
@@ -2537,6 +3527,7 @@ def sample_lds_dataset(run_params):
     data_dict["dataset_params"] = fd.freeze(run_params["dataset_params"])
     data_dict["lds_params"] = params
     return data_dict
+    # return jax.device_put(data_dict, jax.devices("gpu")[0])
 
 # @title Testing the correctness of LDS m-step
 # seed = jr.PRNGKey(0)
@@ -3095,20 +4086,24 @@ def load_pendulum(run_params, log=False):
     def _process_data(data, key):
         processed = data[:, ::2] / 255.0
         processed += jr.normal(key=key, shape=processed.shape) * noise_scale
-        return np.clip(processed, 0, 1)
+        # return np.clip(processed, 0, 1)
+        return processed # We are not cliping the data anymore!
 
     # Take subset, subsample every 2 frames, normalize to [0, 1]
     train_data = _process_data(data["train_obs"][:train_trials], key_train)
+    train_states = data["train_targets"][:train_trials, ::2]
     # val_data = _process_data(data["test_obs"][:val_trials], key_val)
-    val_data = _process_data(
-        np.load("pendulum/pend_regression_longer.npz")["test_obs"][:val_trials], key_pred)
+    data = np.load("pendulum/pend_regression_longer.npz")
+    val_data = _process_data(data["test_obs"][:val_trials], key_pred)
+    val_states = data["test_targets"][:val_trials, ::2]
 
     print("Full dataset:", data["train_obs"].shape)
     print("Subset:", train_data.shape)
     return {
         "train_data": train_data,
         "val_data": val_data,
-        # "val_data_pred": val_data_pred
+        "train_states": train_states,
+        "val_states": val_states,
     }
 
 """# Run experiments!"""
@@ -3216,11 +4211,12 @@ def get_lr(params, max_iters):
     return lr, prior_lr
 
 def expand_lds_parameters(params):
+    num_timesteps = params.get("num_timesteps") or 200
     train_trials = { "small": 10, "medium": 100, "large": 1000 }
     batch_sizes = {"small": 10, "medium": 10, "large": 20 }
     emission_noises = { "small": 10., "medium": 1., "large": .1 }
     dynamics_noises = { "small": 0.01, "medium": .1, "large": .1 }
-    max_iters = 8000
+    max_iters = 20000
 
     # Modify all the architectures according to the parameters given
     D, H, N = params["latent_dims"], params["rnn_dims"], params["emission_dims"]
@@ -3229,13 +4225,8 @@ def expand_lds_parameters(params):
         inf_params["recnet_class"] = "GaussianRecognition"
         architecture = deepcopy(linear_recnet_architecture)
         architecture["output_dim"] = D
-    elif (params["inference_method"] == "dkf"):
+    elif (params["inference_method"] in ["dkf", "cdkf"]):
         inf_params["recnet_class"] = "GaussianBiRNN"
-        architecture = deepcopy(BiRNN_recnet_architecture)
-        architecture["output_dim"] = D
-        architecture["rnn_dim"] = H
-    elif (params["inference_method"] == "cdkf"):
-        inf_params["recnet_class"] = "ConditionalGaussianBiRNN"
         architecture = deepcopy(BiRNN_recnet_architecture)
         architecture["output_dim"] = D
         architecture["rnn_dim"] = H
@@ -3271,12 +4262,14 @@ def expand_lds_parameters(params):
         "dataset_params": {
             "seed": key_0,
             "num_trials": train_trials[params["dataset_size"]],
-            "num_timesteps": 200,
+            "num_timesteps": num_timesteps,
             "emission_cov": emission_noises[params["snr"]],
             "dynamics_cov": dynamics_noises[params["snr"]],
             "latent_dims": D,
             "emission_dims": N,
         },
+        # Implementation choice
+        "use_parallel_kf": True,
         # Training specifics
         "max_iters": max_iters,
         "elbo_samples": 1,
@@ -3308,14 +4301,8 @@ def expand_pendulum_parameters(params):
         architecture = deepcopy(CNN_recnet_architecture)
         architecture["trunk_params"]["output_dim"] = D
         architecture["output_dim"] = D
-    elif (params["inference_method"] == "dkf"):
+    elif (params["inference_method"] in ["dkf", "cdkf"]):
         inf_params["recnet_class"] = "GaussianBiRNN"
-        architecture = deepcopy(CNN_BiRNN_recnet_architecture)
-        architecture["output_dim"] = D
-        architecture["rnn_dim"] = H
-        architecture["input_params"]["output_dim"] = H
-    elif (params["inference_method"] == "cdkf"):
-        inf_params["recnet_class"] = "ConditionalGaussianBiRNN"
         architecture = deepcopy(CNN_BiRNN_recnet_architecture)
         architecture["output_dim"] = D
         architecture["rnn_dim"] = H
@@ -3343,7 +4330,7 @@ def expand_pendulum_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-Pendulum-ICML-3",
+        "project_name": "SVAE-Pendulum-ICML-4",
         "log_to_wandb": True,
         "dataset": "pendulum",
         # Must be model learning
@@ -3356,6 +4343,8 @@ def expand_pendulum_parameters(params):
             "val_trials": val_trials[params["dataset_size"]],
             "emission_cov": noise_scales[params["snr"]]
         },
+        # Implementation choice
+        "use_parallel_kf": True,
         # Training specifics
         "max_iters": max_iters,
         "elbo_samples": 1,
