@@ -512,6 +512,8 @@ class SVAE:
         else:
             kl = self.kl_posterior_prior(posterior_params, prior_params)
 
+        kl /= data.size 
+        ell /= data.size
         elbo = ell - kl
 
         return {
@@ -1343,11 +1345,13 @@ class DeepAutoregressiveDynamics:
         self._mean = None
         self._covariance = None
 
+    @property
     def mean(self):
         if (self._mean is None):
             self.compute_mean_and_cov()
         return self._mean
 
+    @property
     def covariance(self):
         if (self._covariance is None):
             self.compute_mean_and_cov()
@@ -1898,10 +1902,12 @@ class LinearGaussianSSM(tfd.Distribution):
     def expected_states_next_states(self):
         return self._smoothed_cross
 
-    def _mean(self):
+    @property
+    def mean(self):
         return self.smoothed_means
 
-    def _covariance(self):
+    @property
+    def covariance(self):
         return self.smoothed_covariances
     
     # TODO: currently this function does not depend on the dynamics bias
@@ -2475,17 +2481,20 @@ class GaussianDCNNEmission(PotentialNetwork):
 
     input_rank : int = None
     network : nn.Module = None
+    eps : float = None
 
     @classmethod
     def from_params(cls, **params):
-        network = DCNN(**params)
-        return cls(1, network)
+        network = DCNN(input_shape=params["input_shape"], 
+                       layer_params=params["layer_params"])
+        eps = params.get("eps") or 1e-4
+        return cls(1, network, eps)
 
     def __call__(self, inputs):
         out = self._generate_distribution_parameters(inputs)
         mu = out["mu"]
         # Adding a constant to prevent the model from getting too crazy
-        sigma = out["sigma"] + 1e-4
+        sigma = out["sigma"] + self.eps
         return tfd.Normal(loc=mu, scale=sigma)
 
     def _call_single(self, x):
@@ -2495,7 +2504,26 @@ class GaussianDCNNEmission(PotentialNetwork):
         # mu = sigmoid(mu_raw)
         mu = mu_raw
         sigma = softplus(sigma_raw)
-        # sigma = np.ones_like(mu) * 0.1
+        return { "mu": mu, "sigma": sigma }
+
+class GaussianDCNNEmissionFixedCovariance(GaussianDCNNEmission):
+
+    input_rank : int = None
+    network : nn.Module = None
+    output_noise_scale : float = None
+    eps : float = None
+
+    @classmethod
+    def from_params(cls, **params):
+        network = DCNN(input_shape=params["input_shape"], 
+                       layer_params=params["layer_params"])
+        return cls(1, network, params["output_noise_scale"], 0)
+
+    def _call_single(self, x):
+        out_raw = self.network(x)
+        mu_raw, sigma_raw = np.split(out_raw, 2, axis=-1)
+        mu = mu_raw
+        sigma = np.ones_like(mu) * self.output_noise_scale
         return { "mu": mu, "sigma": sigma }
 
 """## Visualizations"""
@@ -3080,6 +3108,9 @@ def predict_multiple(run_params, model_params, model, data, T, key, num_samples=
     model.prior.seq_len = T
     model.posterior.seq_len = T
 
+    run_params = deepcopy(run_params)   
+    run_params["mask_size"] = 0
+
     out = model.elbo(key, data[:T], model_params, **run_params)
     post_params = out["posterior_params"]
     posterior = model.posterior.distribution(post_params)
@@ -3105,24 +3136,20 @@ def predict_multiple(run_params, model_params, model, data, T, key, num_samples=
     # This assumes the pendulum dataset
     # Which has 3d observations (width, height, channels)
     pred_lls = pred_lls.sum(axis=(2, 3, 4))
-    # We want to estimate \log p_tilde(y2|y1) = \log \int p(y2|x2) q(x2|y1) dx2
-    # ~ \log E_q(x2|y1)[p(y2|x2)] 
-    # So instead of mean we compute the logsumexp
-    pred_lls = logsumexp(pred_lls, axis=0) - np.log(num_samples)
     
     # Revert the model sequence length
     model.prior.seq_len = seq_len
     model.posterior.seq_len = seq_len
 
     # Keep only the first 10 samples
-    return post_mean, post_covariance, x_preds[:10], pred_lls
+    return post_mean, post_covariance, x_preds, pred_lls
 
 def get_latents_and_predictions(run_params, model_params, model, data_dict):
     
     key = jr.PRNGKey(42)
 
     # Try to decode true states linearly from model encodings
-    num_predictions = 10
+    num_predictions = 200
     num_examples = 20
     num_frames = 100
 
@@ -3154,28 +3181,41 @@ def get_latents_and_predictions(run_params, model_params, model, data_dict):
     test_data = data_dict["val_data"][:, :num_frames]
     thetas = np.arctan2(test_states[:,:,0], test_states[:,:,1])
     omegas = thetas[:,1:]-thetas[:,:-1]
-
-    partial_mean, partial_cov, test_preds, test_pred_lls = vmap(predict_multiple, 
-        in_axes=(None, None, None, 0, None, None, None))\
-        (run_params, model_params, model, test_data, num_frames//2, key, num_predictions)
     test_mean, test_cov = vmap(encode)(test_data)
     pred_thetas = np.einsum("i,...i->...", W_theta, test_mean)
     theta_mse = np.mean((pred_thetas - thetas) ** 2)
     pred_omegas = np.einsum("i,...i->...", W_omega, test_mean[:,1:])
     omega_mse = np.mean((pred_omegas - omegas) ** 2)
 
-    return {
-        "latent_mean": test_mean,
-        "latent_covariance": test_cov,
-        "latent_mean_partial": partial_mean,
-        "latent_covariance_partial": partial_cov,
-        "prediction_lls": test_pred_lls,
-        "predictions": test_preds,
-        "w_theta": W_theta,
-        "w_omega": W_omega,
-        "theta_mse": theta_mse,
-        "omega_mse": omega_mse,
-    }
+    partial_mean = []
+    partial_cov = []
+    all_preds = []
+    all_pred_lls = []
+    for i in range(num_examples):
+        print("Generating samples for test example:", i)
+        mean, cov, preds, pred_lls = vmap(predict_multiple,
+            in_axes=(None, None, None, 0, None, None, None))\
+            (run_params, model_params, model,
+             data_dict["val_data"][i:i+1,:num_frames], num_frames//2, key, num_predictions)
+        key = jr.split(key)[0]
+        partial_mean.append(mean)
+        partial_cov.append(cov)
+        all_preds.append(preds)
+        all_pred_lls.append(pred_lls)
+
+    return {    
+        "latent_mean": test_mean,   
+        "latent_covariance": test_cov,  
+        "latent_mean_partial": np.concatenate(partial_mean, axis=0),    
+        "latent_covariance_partial": np.concatenate(partial_cov, axis=0),   
+        "prediction_lls": np.concatenate(all_pred_lls, axis=0), 
+        "predictions": np.concatenate(all_preds, axis=0),   
+        "w_theta": W_theta, 
+        "w_omega": W_omega, 
+        "theta_mse": theta_mse, 
+        "omega_mse": omega_mse, 
+    }   
+
 
 def summarize_pendulum_run(trainer, data_dict):
     file_name = "parameters.pkl"
@@ -4185,7 +4225,8 @@ DCNN_decnet_architecture = {
         { "features": 64, "kernel_size": (3, 3), "strides": (2, 2) },
         { "features": 32, "kernel_size": (3, 3), "strides": (2, 2) },
         { "features": 2, "kernel_size": (3, 3) }
-    ]
+    ],  
+    "eps": 1e-4,
 }
 
 # @title Run parameter expanders
@@ -4325,18 +4366,27 @@ def expand_pendulum_parameters(params):
     else:
         print("Inference method not found: " + params["inference_method"])
         assert(False)
+        
+    decnet_architecture = deepcopy(DCNN_decnet_architecture)
+
+    if (params.get("fix_output_covariance")):
+        decnet_class = "GaussianDCNNEmissionFixedCovariance"
+        # Use the known data variance
+        decnet_architecture["output_noise_scale"] = noise_scales[params["snr"]] ** 0.5
+    else:
+        decnet_class = "GaussianDCNNEmission"
+            
     inf_params["recnet_architecture"] = architecture
-    
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-Pendulum-ICML-4",
+        "project_name": "SVAE-Pendulum-ICML-5",
         "log_to_wandb": True,
         "dataset": "pendulum",
         # Must be model learning
         "run_type": "model_learning",
-        "decnet_class": "GaussianDCNNEmission",
-        "decnet_architecture": DCNN_decnet_architecture,
+        "decnet_class": decnet_class,
+        "decnet_architecture": decnet_architecture,
         "dataset_params": {
             "seed": key_0,
             "train_trials": train_trials[params["dataset_size"]],
@@ -4350,7 +4400,7 @@ def expand_pendulum_parameters(params):
         "elbo_samples": 1,
         "sample_kl": False,
         "batch_size": batch_sizes[params["dataset_size"]],
-        "record_params": lambda i: i % 100 == 0,
+        "record_params": lambda i: i % 1000 == 0,
         "plot_interval": 200,
         "mask_type": "potential" if params["inference_method"] == "svae" else "data",
         "learning_rate": lr, 
