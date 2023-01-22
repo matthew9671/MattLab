@@ -4407,7 +4407,9 @@ def expand_pendulum_parameters(params):
         "prior_learning_rate": prior_lr,
         "use_validation": True,
         "constrain_dynamics": True,
+        # Pendulum specific
         "prediction_horizon": 5,
+        "fix_output_covariance": True,
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
