@@ -4369,12 +4369,12 @@ def expand_pendulum_parameters(params):
         
     decnet_architecture = deepcopy(DCNN_decnet_architecture)
 
-    if (params.get("fix_output_covariance")):
-        decnet_class = "GaussianDCNNEmissionFixedCovariance"
+    if (params.get("learn_output_covariance")):
+        decnet_class = "GaussianDCNNEmission"
+    else:
+    	decnet_class = "GaussianDCNNEmissionFixedCovariance"
         # Use the known data variance
         decnet_architecture["output_noise_scale"] = noise_scales[params["snr"]] ** 0.5
-    else:
-        decnet_class = "GaussianDCNNEmission"
             
     inf_params["recnet_architecture"] = architecture
     lr, prior_lr = get_lr(params, max_iters)
@@ -4409,7 +4409,7 @@ def expand_pendulum_parameters(params):
         "constrain_dynamics": True,
         # Pendulum specific
         "prediction_horizon": 5,
-        "fix_output_covariance": True,
+        "learn_output_covariance": False,
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
