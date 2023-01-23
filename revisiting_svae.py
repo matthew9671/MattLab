@@ -4372,7 +4372,7 @@ def expand_pendulum_parameters(params):
     if (params.get("learn_output_covariance")):
         decnet_class = "GaussianDCNNEmission"
     else:
-    	decnet_class = "GaussianDCNNEmissionFixedCovariance"
+        decnet_class = "GaussianDCNNEmissionFixedCovariance"
         # Use the known data variance
         decnet_architecture["output_noise_scale"] = noise_scales[params["snr"]] ** 0.5
             
