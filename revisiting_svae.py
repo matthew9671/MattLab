@@ -4263,10 +4263,13 @@ def expand_lds_parameters(params):
     batch_sizes = {"small": 10, "medium": 10, "large": 20 }
     emission_noises = { "small": 10., "medium": 1., "large": .1 }
     dynamics_noises = { "small": 0.01, "medium": .1, "large": .1 }
+    latent_dims = { "small": 3, "medium": 5, "large": 10 }
+    emission_dims = { "small": 5, "medium": 10, "large": 20 }
     max_iters = 20000
 
     # Modify all the architectures according to the parameters given
-    D, H, N = params["latent_dims"], params["rnn_dims"], params["emission_dims"]
+    # D, H, N = params["latent_dims"], params["rnn_dims"], params["emission_dims"]
+    D, H, N = latent_dims[params["dimensionality"]], params["rnn_dims"], emission_dims[params["dimensionality"]]
     inf_params = {}
     if (params["inference_method"] == "svae"):
         inf_params["recnet_class"] = "GaussianRecognition"
@@ -4323,10 +4326,12 @@ def expand_lds_parameters(params):
         "elbo_samples": 1,
         "sample_kl": False,
         "batch_size": batch_sizes[params["dataset_size"]],
-        "record_params": lambda i: i % 100 == 0,
+        "record_params": lambda i: i % 1000 == 0,
         "plot_interval": 100,
         "learning_rate": lr, 
-        "prior_learning_rate": prior_lr
+        "prior_learning_rate": prior_lr,
+        # Note that we do not specify this in the high-level parameters!
+        "latent_dims": D
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
