@@ -1309,10 +1309,13 @@ class PlaNetPosterior(DKFPosterior):
         output_dummy = np.zeros((self.output_dim,))
         rnn_params = self.network.init(key, input_dummy, latent_dummy, output_dummy)
         return {
-            "rnn_params": rnn_params,
-            "input_dummy": input_dummy,
-            "latent_dummy": latent_dummy,
-            "output_dummy": output_dummy,
+            "network_input": np.zeros((self.seq_len, self.input_dim)),
+            "network_params": {
+                "rnn_params": rnn_params,
+                "input_dummy": input_dummy,
+                "latent_dummy": latent_dummy,
+                "output_dummy": output_dummy,
+            }
         }
 
     def get_constrained_params(self, params):
@@ -1322,6 +1325,9 @@ class PlaNetPosterior(DKFPosterior):
     def distribution(self, params):
         return DeepAutoregressiveDynamics(self.network, params)
         
+    def infer(self, prior_params, posterior_params):
+        return self.get_constrained_params(posterior_params)
+
     # These are just dummies
     def sufficient_statistics(self, params):
         T, D = self.seq_len, self.latent_dims
@@ -1486,7 +1492,7 @@ class LDS(LinearGaussianChainPrior):
     # Also assumes single data points
     def marginal_log_likelihood(self, params, data):
         posterior = self.posterior.distribution(self.e_step(params, data))
-        states = posterior.mean()
+        states = posterior.mean
         prior_ll = self.log_prob(params, states, data)
         posterior_ll = posterior.log_prob(states)
         # This is numerically unstable!
@@ -2410,7 +2416,7 @@ class PlaNetRecognitionWrapper:
     
     def apply(self, params, x):
         return {
-            "network_input": self.rec_net.apply(params["rec_params"], x)["h"],
+            "network_input": self.rec_net.apply(params["rec_params"], x)["bs"],
             "network_params": params["post_params"],
         }
 
@@ -2805,7 +2811,7 @@ class Trainer:
               callback=None, val_callback=None, 
               summary=None, key=None,
               early_stop_start=20000, 
-              max_lose_streak=1000):
+              max_lose_streak=2000):
 
         if key is None:
             key = jr.PRNGKey(0)
@@ -3240,7 +3246,7 @@ def svae_init(key, model, data, initial_params=None, **train_params):
     if (train_params["inference_method"] == "planet"):
         init_params["rec_params"] = {
             "rec_params": init_params["rec_params"],
-            "post_params": init_params["post_params"]
+            "post_params": init_params["post_params"]["network_params"]
         }
     # Expand the posterior parameters by batch size
     init_params["post_params"] = vmap(lambda _: init_params["post_params"])(data)
@@ -4276,9 +4282,10 @@ def expand_lds_parameters(params):
         # Most likely we're not even going to use this so it should be fine
         # If we want smoothing then we can probably just replace these with the
         # BiRNN version
-        inf_params["recnet_class"] = "GaussianRecognition"
-        architecture = deepcopy(linear_recnet_architecture)
+        inf_params["recnet_class"] = "GaussianBiRNN"
+        architecture = deepcopy(BiRNN_recnet_architecture)
         architecture["output_dim"] = H
+        architecture["rnn_dim"] = H
         post_arch = deepcopy(planet_posterior_architecture)
         post_arch["input_dim"] = H
         post_arch["rnn_dim"] = H
@@ -4353,10 +4360,11 @@ def expand_pendulum_parameters(params):
         # Most likely we're not even going to use this so it should be fine
         # If we want smoothing then we can probably just replace these with the
         # BiRNN version
-        inf_params["recnet_class"] = "GaussianRecognition"
-        architecture = deepcopy(CNN_recnet_architecture)
-        architecture["trunk_params"]["output_dim"] = H
+        inf_params["recnet_class"] = "GaussianBiRNN"
+        architecture = deepcopy(CNN_BiRNN_recnet_architecture)
         architecture["output_dim"] = H
+        architecture["rnn_dim"] = H
+        architecture["input_params"]["output_dim"] = H
         post_arch = deepcopy(planet_posterior_architecture)
         post_arch["input_dim"] = H
         post_arch["rnn_dim"] = H
