@@ -1278,19 +1278,26 @@ class CDKFPosterior(LinearGaussianChainPrior):
 class DKFPosterior(CDKFPosterior):
     def get_constrained_params(self, params):
         p = copy.deepcopy(params)
-        # The DKF produces a factored posterior
-        # So we don't need the dynamics matrix
-        p.pop("As", None)
+        # The DKF produces a factored posterior\n",
+        # So the dynamics matrix is zeroed out\n",
+        p["As"] *= 0
+        dist = LinearGaussianChain.from_nonstationary_dynamics(p["As"], p["bs"], p["Qs"])
+        p.update({
+            "Ex": dist.expected_states,
+            "ExxT": dist.expected_states_squared,
+            "ExnxT": dist.expected_states_next_states
+        })
         return p
 
-    def distribution(self, params):
-        T, D = self.seq_len, self.latent_dims
-        bs, Qs = params["bs"], params["Qs"]
-        dist = MVN(loc=bs, covariance_matrix=Qs)
-        dist.expected_states = bs
-        dist.expected_states_squared = np.einsum("...i,...j->...ij", bs, bs) + Qs
-        dist.expected_states_next_states = np.einsum("...i,...j->...ji", bs[:-1], bs[1:])
-        return dist
+    # This seems to be faulty...!!
+    # def distribution(self, params):
+    #     T, D = self.seq_len, self.latent_dims
+    #     bs, Qs = params["bs"], params["Qs"]
+    #     dist = MVN(loc=bs, covariance_matrix=Qs)
+    #     dist.expected_states = bs
+    #     dist.expected_states_squared = np.einsum("...i,...j->...ij", bs, bs) + Qs
+    #     dist.expected_states_next_states = np.einsum("...i,...j->...ji", bs[:-1], bs[1:])
+    #     return dist
 
 # @title PlaNet type posterior
 # The infer function for the DKF version just uses the posterior params 
@@ -2810,7 +2817,7 @@ class Trainer:
     def train(self, data_dict, max_iters, 
               callback=None, val_callback=None, 
               summary=None, key=None,
-              early_stop_start=20000, 
+              early_stop_start=10000, 
               max_lose_streak=2000):
 
         if key is None:
@@ -4310,6 +4317,8 @@ def expand_lds_parameters(params):
         "project_name": "SVAE-LDS-ICML-1",
         "log_to_wandb": True,
         "dataset": "lds",
+        # We're just doing model learning since we're lazy
+        "run_type": "model_learning",
         "dataset_params": {
             "seed": key_0,
             "num_trials": train_trials[params["dataset_size"]],
