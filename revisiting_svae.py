@@ -2214,21 +2214,21 @@ class CNN(nn.Module):
         x = nn.Dense(features=self.output_dim)(x.flatten())
         return x
 
-class TemporalCNN(nn.Module):   
+class TemporalCNN(nn.Module):
     """Same as CNN, but we don't flatten the output.""" 
-    input_rank : int = None     
-    output_dim : int = None 
-    layer_params : Sequence[dict] = None    
-    @nn.compact 
-    def __call__(self, x):  
-        for params in self.layer_params:    
-            x = nn.relu(Conv(**params)(x))  
-        # No activations at the output  
-        x = nn.Dense(features=self.output_dim)(x)   
+    input_rank : int = None
+    output_dim : int = None
+    layer_params : Sequence[dict] = None
+    @nn.compact
+    def __call__(self, x):
+        for params in self.layer_params:
+            x = nn.relu(Conv(**params)(x))
+        # No activations at the output
+        x = nn.Dense(features=self.output_dim)(x)
         return x
 
 class DCNN(nn.Module):
-    """A simple DCNN model."""   
+    """A simple DCNN model."""
 
     input_shape: Sequence[int] = None
     layer_params: Sequence[dict] = None
@@ -2426,63 +2426,64 @@ class GaussianBiRNN(PosteriorNetwork):
 
         return (A, b, Q)
 
-class TemporalConv(PosteriorNetwork):       
-            
-    input_rank : int = None     
-    output_dim : int = None     
-    input_fn : nn.Module = None     
-    CNN : nn.Module = None      
-    head_mean_fn : nn.Module = None     
-    head_log_var_fn : nn.Module = None      
-    head_dyn_fn : nn.Module = None      
-    eps : float = None      
-                
-    @classmethod        
-    def from_params(cls, input_rank=1,      
-                    input_dim=None, output_dim=None,        
-                    input_type="Identity", input_params=None,       
-                    cnn_params=None,        
-                    head_mean_type="MLP", head_mean_params=None,        
-                    head_var_type="MLP", head_var_params=None,      
-                    head_dyn_type="MLP", head_dyn_params=None,      
-                    cov_init=1, eps=1e-4):      
-        if input_type == "Identity":        
-            input_params = { "features": input_dim }        
-        if head_mean_type == "MLP":     
-            head_mean_params["features"] += [output_dim]        
-        if head_var_type == "MLP":      
-            head_var_params["features"] += [output_dim * (output_dim + 1) // 2]     
-            head_var_params["kernel_init"] = nn.initializers.zeros      
-            head_var_params["bias_init"] = nn.initializers.constant(cov_init)       
-        if head_dyn_type == "MLP":      
-            head_dyn_params["features"] += [output_dim ** 2,]       
-            head_dyn_params["kernel_init"] = nn.initializers.zeros      
-            head_dyn_params["bias_init"] = nn.initializers.zeros        
-        cnn = TemporalCNN(**cnn_params)     
-        input_fn = globals()[input_type](**input_params)        
-        head_mean_fn = globals()[head_mean_type](**head_mean_params)        
-        head_log_var_fn = globals()[head_var_type](**head_var_params)       
-        head_dyn_fn = globals()[head_dyn_type](**head_dyn_params)       
-        return cls(input_rank, output_dim, input_fn, cnn,       
-                   head_mean_fn, head_log_var_fn, head_dyn_fn, eps)     
+class TemporalConv(PosteriorNetwork):
+
+    input_rank : int = None
+    output_dim : int = None
+    input_fn : nn.Module = None
+    CNN : nn.Module = None
+    head_mean_fn : nn.Module = None
+    head_log_var_fn : nn.Module = None
+    head_dyn_fn : nn.Module = None
+    eps : float = None
+
+    @classmethod
+    def from_params(cls, input_rank=1,
+                    input_dim=None, output_dim=None,
+                    input_type="Identity", input_params=None,
+                    cnn_params=None,
+                    head_mean_type="MLP", head_mean_params=None,
+                    head_var_type="MLP", head_var_params=None,
+                    head_dyn_type="MLP", head_dyn_params=None,
+                    cov_init=1, eps=1e-4):
+        if input_type == "Identity":
+            input_params = { "features": input_dim }
+        if head_mean_type == "MLP":
+            head_mean_params["features"] += [output_dim]
+        if head_var_type == "MLP":
+            head_var_params["features"] += [output_dim * (output_dim + 1) // 2]
+            head_var_params["kernel_init"] = nn.initializers.zeros
+            head_var_params["bias_init"] = nn.initializers.constant(cov_init)
+        if head_dyn_type == "MLP":
+            head_dyn_params["features"] += [output_dim ** 2,]
+            head_dyn_params["kernel_init"] = nn.initializers.zeros
+            head_dyn_params["bias_init"] = nn.initializers.zeros
+        cnn = TemporalCNN(**cnn_params)
+        input_fn = globals()[input_type](**input_params)
+        head_mean_fn = globals()[head_mean_type](**head_mean_params)
+        head_log_var_fn = globals()[head_var_type](**head_var_params)
+        head_dyn_fn = globals()[head_dyn_type](**head_dyn_params)
+        return cls(input_rank, output_dim, input_fn, cnn,
+                   head_mean_fn, head_log_var_fn, head_dyn_fn, eps)
+
     # Applied the BiRNN to a single sequence of inputs      
-    def _call_single(self, inputs):     
-        output_dim = self.output_dim        
-                
-        inputs = vmap(self.input_fn)(inputs)        
-        out = self.CNN(inputs)      
-                
-        # Get the mean.     
-        # vmap over the time dimension      
-        b = vmap(self.head_mean_fn)(out)        
-        # Get the variance output and reshape it.       
-        # vmap over the time dimension      
-        var_output_flat = vmap(self.head_log_var_fn)(out)       
+    def _call_single(self, inputs):
+        output_dim = self.output_dim
+        
+        inputs = vmap(self.input_fn)(inputs)
+        out = self.CNN(inputs)
+        
+        # Get the mean.
+        # vmap over the time dimension
+        b = vmap(self.head_mean_fn)(out)
+        # Get the variance output and reshape it.
+        # vmap over the time dimension
+        var_output_flat = vmap(self.head_log_var_fn)(out)
         Q = vmap(lie_params_to_constrained, in_axes=(0, None, None))\
-            (var_output_flat, output_dim, self.eps)     
-        dynamics_flat = vmap(self.head_dyn_fn)(out)     
-        A = dynamics_flat.reshape((-1, output_dim, output_dim))     
-        return (A, b, Q)        
+            (var_output_flat, output_dim, self.eps)
+        dynamics_flat = vmap(self.head_dyn_fn)(out)
+        A = dynamics_flat.reshape((-1, output_dim, output_dim))
+        return (A, b, Q)
 
 
 # @title Special architectures for PlaNet
@@ -3193,7 +3194,7 @@ def predict_multiple(run_params, model_params, model, data, T, key, num_samples=
     model.prior.seq_len = T
     model.posterior.seq_len = T
 
-    run_params = deepcopy(run_params)   
+    run_params = deepcopy(run_params)
     run_params["mask_size"] = 0
 
     out = model.elbo(key, data[:T], model_params, **run_params)
@@ -3288,7 +3289,7 @@ def get_latents_and_predictions(run_params, model_params, model, data_dict):
         all_preds.append(preds)
         all_pred_lls.append(pred_lls)
 
-    return {    
+    return {
         "latent_mean": test_mean,
         "latent_covariance": test_cov,
         "latent_mean_partial": np.concatenate(partial_mean, axis=0),
@@ -3300,7 +3301,6 @@ def get_latents_and_predictions(run_params, model_params, model, data_dict):
         "theta_mse": theta_mse,
         "omega_mse": omega_mse,
     }
-
 
 def summarize_pendulum_run(trainer, data_dict):
     file_name = "parameters.pkl"
@@ -4257,23 +4257,23 @@ BiRNN_recnet_architecture = {
     "cov_init": 1,
 }
 
-# 1d convolution on the time dimension  
-temporal_conv_layers = [    
-            {"features": 32, "kernel_size": (10,), "strides": (1,),},   
-            {"features": 32, "kernel_size": (10,), "strides": (1,),},   
-            {"features": 32, "kernel_size": (10,), "strides": (1,),},   
+# 1d convolution on the time dimension
+temporal_conv_layers = [
+            {"features": 32, "kernel_size": (10,), "strides": (1,),},
+            {"features": 32, "kernel_size": (10,), "strides": (1,),},
+            {"features": 32, "kernel_size": (10,), "strides": (1,),},
 ]
 
-conv_recnet_architecture = {    
-    "input_rank": 1,    
-    "cnn_params": { 
-        "layer_params": temporal_conv_layers    
-    },  
-    "head_mean_params": { "features": [20, 20] },   
-    "head_var_params": { "features": [20, 20] },    
-    "head_dyn_params": { "features": [20,] },   
-    "eps": 1e-4,    
-    "cov_init": 1,  
+conv_recnet_architecture = {
+    "input_rank": 1,
+    "cnn_params": {
+        "layer_params": temporal_conv_layers
+    },
+    "head_mean_params": { "features": [20, 20] },
+    "head_var_params": { "features": [20, 20] },
+    "head_dyn_params": { "features": [20,] },
+    "eps": 1e-4,
+    "cov_init": 1,
 }
 
 planet_posterior_architecture = {
@@ -4309,6 +4309,23 @@ CNN_recnet_architecture = {
     "eps": 1e-4,
     "cov_init": 1,
 }
+
+CNN_conv_recnet_architecture = {
+    "input_rank": 3,
+    "input_type": "CNN",
+    "input_params":{
+        "layer_params": CNN_layers
+    },
+    "cnn_params": {
+        "layer_params": temporal_conv_layers
+    },
+    "head_mean_params": { "features": [20, 20] },
+    "head_var_params": { "features": [20, 20] },
+    "head_dyn_params": { "features": [20,] },
+    "eps": 1e-4,
+    "cov_init": 1,
+}
+
 
 CNN_BiRNN_recnet_architecture = {
     "input_rank": 3,
@@ -4399,6 +4416,14 @@ def expand_lds_parameters(params):
         architecture["output_dim"] = D  
         # The output heads will output distributions in D dimensional space 
         architecture["cnn_params"]["output_dim"] = H
+
+        # Change the convolution kernel size
+        kernel_size = params.get("conv_kernel_size") or "medium"
+        kernel_sizes = { "small": 10, "medium": 20, "large": 50 }
+        size = kernel_sizes[kernel_size]
+
+        for layer in architecture["cnn_params"]["layer_params"]:
+            layer["kernel_size"] = (size,)
     else:
         print("Inference method not found: " + params["inference_method"])
         assert(False)
@@ -4466,6 +4491,20 @@ def expand_pendulum_parameters(params):
         architecture["output_dim"] = D
         architecture["rnn_dim"] = H
         architecture["input_params"]["output_dim"] = H
+    elif (params["inference_method"] in ["conv"]):
+        inf_params["recnet_class"] = "TemporalConv"
+        architecture = deepcopy(CNN_conv_recnet_architecture)
+        architecture["output_dim"] = D
+        # The output heads will output distributions in D dimensional space
+        architecture["cnn_params"]["output_dim"] = H
+        architecture["input_params"]["output_dim"] = H
+        # Change the convolution kernel size
+        kernel_size = params.get("conv_kernel_size") or "medium"
+        kernel_sizes = { "small": 10, "medium": 20, "large": 50 }
+        size = kernel_sizes[kernel_size]
+
+        for layer in architecture["cnn_params"]["layer_params"]:
+            layer["kernel_size"] = (size,)
     elif (params["inference_method"] == "planet"):
         # Here we're considering the filtering setting as default
         # Most likely we're not even going to use this so it should be fine
