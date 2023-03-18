@@ -34,6 +34,8 @@ if __name__ == '__main__':
     parser.add_argument('--mask_size', type=int)
     parser.add_argument('--mask_start', type=int)
 
+    parser.add_argument('--conv_kernel_size', type=str)
+
     args = parser.parse_args()
     run_params = vars(args)
     run_params["seed"] = jr.PRNGKey(run_params["seed"])

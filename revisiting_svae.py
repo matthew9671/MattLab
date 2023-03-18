@@ -451,7 +451,8 @@ class SVAE:
         else:
             return np.mean(posterior.log_prob(samples) - prior.log_prob(samples))
 
-    def elbo(self, key, data, model_params, sample_kl=False, **params):
+    def elbo(self, key, data, target, # Added the new target parameter 
+             model_params, sample_kl=False, **params):
         rec_params = model_params["rec_params"]
         dec_params = model_params["dec_params"]
         prior_params = self.prior.get_constrained_params(model_params["prior_params"])
@@ -497,10 +498,9 @@ class SVAE:
         num_samples = params.get("obj_samples") or 1
         samples = self.posterior.sample(posterior_params, (num_samples,), key)
         # and compute average ll
-
         def likelihood_outputs(latent):
             likelihood_dist = self.decoder.apply(dec_params, latent)
-            return likelihood_dist.mean(), likelihood_dist.log_prob(data)
+            return likelihood_dist.mean(), likelihood_dist.log_prob(target)
 
         mean, ells = vmap(likelihood_outputs)(samples)
         # Take average over samples then sum the rest
@@ -512,8 +512,8 @@ class SVAE:
         else:
             kl = self.kl_posterior_prior(posterior_params, prior_params)
 
-        kl /= data.size
-        ell /= data.size
+        kl /= target.size
+        ell /= target.size
         elbo = ell - kl
 
         return {
@@ -526,8 +526,8 @@ class SVAE:
             "mask": mask
         }
 
-    def compute_objective(self, key, data, model_params, **params):
-        results = self.elbo(key, data, model_params, **params)
+    def compute_objective(self, key, data, target, model_params, **params):
+        results = self.elbo(key, data, target, model_params, **params)
         results["objective"] = results["elbo"]
         return results
 
@@ -1214,15 +1214,22 @@ class LinearGaussianChainPrior(SVAEPrior):
 # This is a bit clumsy but it's the best we can do without using some sophisticated way
 # Of marking the constrained/optimized parameters vs. unconstrained parameters
 class LieParameterizedLinearGaussianChainPrior(LinearGaussianChainPrior):
+
+    def __init__(self, latent_dims, seq_len, init_dynamics_noise_scale=1):
+        super().__init__(latent_dims, seq_len)
+        self.init_dynamics_noise_scale = init_dynamics_noise_scale
+
     def init(self, key):
         D = self.latent_dims
         key_A, key = jr.split(key, 2)
         # Equivalent to the unit matrix
-        Q_flat = np.concatenate([np.ones(D) * inv_softplus(1), np.zeros((D*(D-1)//2))])
+        Q_flat = np.concatenate([np.ones(D) 
+            * inv_softplus(self.init_dynamics_noise_scale), np.zeros((D*(D-1)//2))])
+        Q1_flat = np.concatenate([np.ones(D) * inv_softplus(1), np.zeros((D*(D-1)//2))])
         params = {
             "m1": np.zeros(D),
             "A": random_rotation(key_A, D, theta=np.pi/20),
-            "Q1": Q_flat,
+            "Q1": Q1_flat,
             "b": np.zeros(D),
             "Q": Q_flat
         }
@@ -2215,10 +2222,11 @@ class CNN(nn.Module):
         return x
 
 class TemporalCNN(nn.Module):
-    """Same as CNN, but we don't flatten the output.""" 
+    """Same as CNN, but we don't flatten the output."""
     input_rank : int = None
     output_dim : int = None
     layer_params : Sequence[dict] = None
+
     @nn.compact
     def __call__(self, x):
         for params in self.layer_params:
@@ -2247,19 +2255,7 @@ class DCNN(nn.Module):
 class PotentialNetwork(nn.Module):
     def __call__(self, inputs):
         Sigma, mu = self._generate_distribution_parameters(inputs)
-        # J, h = solve(Sigma, np.eye(mu.shape[-1])[None]), solve(Sigma, mu)
-        # if (len(J.shape) == 3):
-        #     seq_len, latent_dims, _ = J.shape
-        #     # lower diagonal blocks of precision matrix
-        #     L = np.zeros((seq_len-1, latent_dims, latent_dims))
-        # elif (len(J.shape) == 4):
-        #     batch_size, seq_len, latent_dims, _ = J.shape
-        #     # lower diagonal blocks of precision matrix
-        #     L = np.zeros((batch_size, seq_len-1, latent_dims, latent_dims))
-        # else:
-        #     L = np.zeros(tuple())
-        return {#"J": J, "L": L, "h": h, 
-                "Sigma": Sigma, "mu": mu}
+        return { "Sigma": Sigma, "mu": mu }
 
     def _generate_distribution_parameters(self, inputs):
         if (len(inputs.shape) == self.input_rank + 2):
@@ -2348,6 +2344,7 @@ class PosteriorNetwork(PotentialNetwork):
 
 class GaussianBiRNN(PosteriorNetwork):
     
+    use_diag : int = None
     input_rank : int = None
     rnn_dim : int = None
     output_dim : int = None
@@ -2368,6 +2365,7 @@ class GaussianBiRNN(PosteriorNetwork):
                     head_mean_type="MLP", head_mean_params=None,
                     head_var_type="MLP", head_var_params=None,
                     head_dyn_type="MLP", head_dyn_params=None,
+                    diagonal_covariance=False,
                     cov_init=1, eps=1e-4): 
 
         forward_RNN = nn.scan(cell_type, variable_broadcast="params", 
@@ -2381,7 +2379,10 @@ class GaussianBiRNN(PosteriorNetwork):
         if head_mean_type == "MLP":
             head_mean_params["features"] += [output_dim]
         if head_var_type == "MLP":
-            head_var_params["features"] += [output_dim * (output_dim + 1) // 2]
+            if (diagonal_covariance):
+                head_var_params["features"] += [output_dim]
+            else:
+                head_var_params["features"] += [output_dim * (output_dim + 1) // 2]
             head_var_params["kernel_init"] = nn.initializers.zeros
             head_var_params["bias_init"] = nn.initializers.constant(cov_init)
         if head_dyn_type == "MLP":
@@ -2395,7 +2396,7 @@ class GaussianBiRNN(PosteriorNetwork):
         head_log_var_fn = globals()[head_var_type](**head_var_params)
         head_dyn_fn = globals()[head_dyn_type](**head_dyn_params)
 
-        return cls(input_rank, rnn_dim, output_dim, 
+        return cls(diagonal_covariance, input_rank, rnn_dim, output_dim, 
                    forward_RNN, backward_RNN, 
                    input_fn, trunk_fn, 
                    head_mean_fn, head_log_var_fn, head_dyn_fn, eps)
@@ -2419,8 +2420,11 @@ class GaussianBiRNN(PosteriorNetwork):
         # Get the variance output and reshape it.
         # vmap over the time dimension
         var_output_flat = vmap(self.head_log_var_fn)(out_combined)
-        Q = vmap(lie_params_to_constrained, in_axes=(0, None, None))\
-            (var_output_flat, output_dim, self.eps)
+        if self.use_diag:
+            Q = vmap(np.diag)(softplus(var_output_flat) + self.eps)
+        else:
+            Q = vmap(lie_params_to_constrained, in_axes=(0, None, None))\
+                (var_output_flat, output_dim, self.eps)
         dynamics_flat = vmap(self.head_dyn_fn)(out_combined)
         A = dynamics_flat.reshape((-1, output_dim, output_dim))
 
@@ -2458,15 +2462,17 @@ class TemporalConv(PosteriorNetwork):
             head_dyn_params["features"] += [output_dim ** 2,]
             head_dyn_params["kernel_init"] = nn.initializers.zeros
             head_dyn_params["bias_init"] = nn.initializers.zeros
+
         cnn = TemporalCNN(**cnn_params)
         input_fn = globals()[input_type](**input_params)
         head_mean_fn = globals()[head_mean_type](**head_mean_params)
         head_log_var_fn = globals()[head_var_type](**head_var_params)
         head_dyn_fn = globals()[head_dyn_type](**head_dyn_params)
+
         return cls(input_rank, output_dim, input_fn, cnn,
                    head_mean_fn, head_log_var_fn, head_dyn_fn, eps)
 
-    # Applied the BiRNN to a single sequence of inputs      
+    # Applied the BiRNN to a single sequence of inputs
     def _call_single(self, inputs):
         output_dim = self.output_dim
         
@@ -2476,6 +2482,7 @@ class TemporalConv(PosteriorNetwork):
         # Get the mean.
         # vmap over the time dimension
         b = vmap(self.head_mean_fn)(out)
+
         # Get the variance output and reshape it.
         # vmap over the time dimension
         var_output_flat = vmap(self.head_log_var_fn)(out)
@@ -2483,8 +2490,8 @@ class TemporalConv(PosteriorNetwork):
             (var_output_flat, output_dim, self.eps)
         dynamics_flat = vmap(self.head_dyn_fn)(out)
         A = dynamics_flat.reshape((-1, output_dim, output_dim))
-        return (A, b, Q)
 
+        return (A, b, Q)
 
 # @title Special architectures for PlaNet
 class PlaNetRecognitionWrapper:
@@ -2611,6 +2618,12 @@ class GaussianDCNNEmissionFixedCovariance(GaussianDCNNEmission):
         mu = mu_raw
         sigma = np.ones_like(mu) * self.output_noise_scale
         return { "mu": mu, "sigma": sigma }
+
+class PoissonEmissions(GaussianRecognition):
+    def __call__(self, inputs):
+        _, mu = self._generate_distribution_parameters(inputs)
+        # Softplus rate should be more stable than directly setting log-rate
+        return tfd.Poisson(rate=softplus(mu) + self.eps)
 
 """## Visualizations"""
 
@@ -2865,23 +2878,43 @@ class Trainer:
         if update is not None: 
             self.update = update
 
-    # @partial(jit, static_argnums=(0,))
-    def train_step(self, key, params, data, opt_states):
+    def train_step(self, key, params, data, target, opt_states, itr):
         model = self.model
         results = \
             jax.value_and_grad(
-                lambda params: partial(self.loss, **self.train_params)(key, model, data, params), has_aux=True)(params)
+                lambda params: partial(self.loss, itr=itr, **self.train_params)\
+                (key, model, data, target, params), has_aux=True)(params)
         (loss, aux), grads = results
         params, opts = self.update(params, grads, self.opts, opt_states, model, aux, **self.train_params)
         return params, opts, (loss, aux), grads
 
-    # @partial(jit, static_argnums=(0,))
-    def val_step(self, key, params, data):
-        return self.val_loss(key, self.model, data, params, **self.train_params)
+    def val_step(self, key, params, data, target):
+        return self.val_loss(key, self.model, data, target, params)
 
-    # def test_step(self, key, params, model, data):
-    #     loss_out = self.loss(key, params, model, data)
-    #     return loss_out
+    def val_epoch(self, key, params, data, target):
+
+        batch_size = self.train_params.get("batch_size") or data.shape[0]
+
+        num_batches = data.shape[0] // batch_size
+
+        loss_sum = 0
+        aux_sum = None
+
+        for batch_id in range(num_batches):
+            batch_start = batch_id * batch_size
+            loss, aux = self.val_step_jitted(key, params, 
+                                        data[batch_start:batch_start+batch_size], 
+                                        target[batch_start:batch_start+batch_size])
+            loss_sum += loss
+            if aux_sum is None:
+                aux_sum = aux
+            else:
+                aux_sum = jax.tree_map(lambda a,b: a+b, aux_sum, aux)
+            key, _ = jr.split(key)
+        
+        loss_avg = loss_sum / num_batches
+        aux_avg = jax.tree_map(lambda a: a / num_batches, aux_sum)
+        return loss_avg, aux_avg
 
     """
     Callback: a function that takes training iterations and relevant parameter
@@ -2898,6 +2931,11 @@ class Trainer:
 
         model = self.model
         train_data = data_dict["train_data"]
+        train_targets = data_dict.get("train_targets")
+        if (train_targets is None): train_targets = train_data
+        val_data = data_dict.get("val_data")
+        val_targets = data_dict.get("val_targets")
+        if (val_targets is None): val_targets = val_targets = val_data
         batch_size = self.train_params.get("batch_size") or train_data.shape[0]
         num_batches = train_data.shape[0] // batch_size
 
@@ -2922,11 +2960,13 @@ class Trainer:
             self.train_params["mask_size"] = 0
 
         train_step = jit(self.train_step)
-        val_step = jit(self.val_step)
+        self.val_step_jitted = jit(self.val_step)
 
         best_loss = None
         best_itr = 0
         val_loss = None
+
+        indices = np.arange(train_data.shape[0], dtype=int)
 
         for itr in pbar:
             train_key, val_key, key = jr.split(key, 3)
@@ -2937,8 +2977,11 @@ class Trainer:
             # t = time()
             # Training step
             # ----------------------------------------
+            batch_indices = indices[batch_start:batch_start+batch_size]
             step_results = train_step(train_key, self.params, 
-                           train_data[batch_start:batch_start+batch_size], self.opt_states)
+                           train_data[batch_indices],
+                           train_targets[batch_indices], 
+                           self.opt_states, itr)
             self.params, self.opt_states, loss_out, grads = step_results#\
                 # jax.tree_map(lambda x: x.block_until_ready(), step_results)
             # ----------------------------------------
@@ -2949,12 +2992,14 @@ class Trainer:
             self.train_losses.append(loss)
             pbar.set_description("LP: {:.3f}".format(loss))
 
+            if (callback): callback(self, loss_out, data_dict, grads)
+
             if batch_id == num_batches - 1:
                 # We're at the end of an epoch
                 # We could randomly shuffle the data
-                # train_data = jr.permutation(key, train_data)
+                indices = jr.permutation(key, indices)
                 if (self.train_params.get("use_validation")):
-                    val_loss_out = val_step(val_key, self.params, data_dict["val_data"])
+                    val_loss_out = self.val_epoch(val_key, self.params, val_data, val_targets)
                     if (val_callback): val_callback(self, val_loss_out, data_dict)
                     val_loss, _ = val_loss_out
                     
@@ -2970,8 +3015,6 @@ class Trainer:
                 if curr_loss > best_loss and itr - best_itr > max_lose_streak:
                     print("Early stopping!")
                     break
-
-            if (callback): callback(self, loss_out, data_dict, grads)
 
             # Record parameters
             record_params = self.train_params.get("record_params")
@@ -3049,6 +3092,7 @@ def visualize_pendulum(trainer, aux):
 def get_group_name(run_params):
     p = run_params
     run_type = "" if p["inference_method"] in ["EM", "GT", "SMC"] else "_" + p["run_type"]
+    is_diag = "_diag" if p.get("diagonal_covariance") else ""
     if p["dataset"] == "pendulum":
         dataset_summary = "pendulum"
     elif p["dataset"] == "lds":
@@ -3056,6 +3100,8 @@ def get_group_name(run_params):
         dataset_summary = "lds_dims_{}_{}_noises_{}_{}".format(
             d["latent_dims"], d["emission_dims"], 
             d["dynamics_cov"], d["emission_cov"])
+    elif p["dataset"] == "nlb":
+        dataset_summary = "nlb"
     else:
         dataset_summary = "???"
 
@@ -3067,7 +3113,7 @@ def get_group_name(run_params):
     group_name = (group_tag +
         dataset_summary
         + model_summary
-        + run_type
+        + run_type + is_diag
     )
     return group_name
 
@@ -3100,7 +3146,18 @@ def validation_log_to_wandb(trainer, loss_out, data_dict):
         
     to_log = {"Validation ELBO": elbo, "Validation KL": kl, "Validation likelihood": ell,}
     to_log.update(visualizations)
+
+    if (p["dataset"] == "nlb"): 
+        to_log["Validation BPS"] = compute_bps(aux, data_dict["val_targets"])
+    
     wandb.log(to_log)
+
+def compute_bps(out, targets):
+    eps = 1e-8
+    mean_rate = np.nanmean(targets, axis=(0,1), keepdims=True)
+    baseline = tfd.Poisson(rate=mean_rate+eps).log_prob(targets)
+    num_spikes = np.sum(targets)
+    return (np.mean(out["ell"]) * targets.size - np.sum(baseline)) / num_spikes / np.log(2)
 
 def log_to_wandb(trainer, loss_out, data_dict, grads):
     p = trainer.train_params
@@ -3168,6 +3225,12 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
                "Condition number of A": A_cond_num, "Condition number of Q": Q_cond_num,
                "Learning rate": lr, "Prior learning rate": prior_lr }
     to_log.update(visualizations)
+
+    if (p["dataset"] == "nlb"): 
+        to_log["Train BPS"] = compute_bps(aux, data_dict["train_targets"])
+    if (p.get("beta")):
+        to_log["Beta"] = p["beta"](itr)
+
     wandb.log(to_log)
 
 def save_params_to_wandb(trainer, data_dict):
@@ -3353,24 +3416,30 @@ def svae_init(key, model, data, initial_params=None, **train_params):
             (rec_opt, dec_opt, prior_opt), 
             (rec_opt_state, dec_opt_state, prior_opt_state))
     
-def svae_loss(key, model, data_batch, model_params, **train_params):
+def svae_loss(key, model, data_batch, target_batch, model_params, itr=0, **train_params):
     batch_size = data_batch.shape[0]
     # Axes specification for vmap
     # We're just going to ignore this for now
     params_in_axes = None
-    # params_in_axes = dict.fromkeys(model_params.keys(), None)
-    # params_in_axes["post_samples"] = 0
     result = vmap(partial(model.compute_objective, **train_params), 
-                  in_axes=(0, 0, params_in_axes))(jr.split(key, batch_size), data_batch, model_params)
-    objs = result["objective"]
-    post_params = result["posterior_params"]
-    post_samples = result["posterior_samples"]
+                  in_axes=(0, 0, 0, params_in_axes))\
+                  (jr.split(key, batch_size), data_batch, target_batch, model_params)
     # Need to compute sufficient stats if we want the natural gradient update
     if (train_params.get("use_natural_grad")):
+        post_params = result["posterior_params"]
+        post_samples = result["posterior_samples"]
         post_suff_stats = vmap(model.posterior.sufficient_statistics)(post_params)
         expected_post_suff_stats = tree_map(
             lambda l: np.mean(l,axis=0), post_suff_stats)
         result["sufficient_statistics"] = expected_post_suff_stats
+    
+    # objs = result["objective"]
+    if (train_params.get("beta") is None):
+        beta = 1
+    else:
+        beta = train_params["beta"](itr)
+    objs = result["ell"] - beta * result["kl"]
+
     return -np.mean(objs), result
 
 def predict_forward(x, A, b, T):
@@ -3379,8 +3448,7 @@ def predict_forward(x, A, b, T):
         return carry, carry
     return scan(_step, x, np.arange(T))[1]
 
-# Note: this is for pendulum data only
-def svae_val_loss(key, model, data_batch, model_params, **train_params):  
+def svae_pendulum_val_loss(key, model, data_batch, target_batch, model_params, **train_params):  
     N, T = data_batch.shape[:2]
     # We only care about the first 100 timesteps
     T = T // 2
@@ -3388,7 +3456,7 @@ def svae_val_loss(key, model, data_batch, model_params, **train_params):
 
     # obs_data, pred_data = data_batch[:,:T//2], data_batch[:,T//2:]
     obs_data = data_batch[:,:T]
-    obj, out_dict = svae_loss(key, model, obs_data, model_params, **train_params)
+    obj, out_dict = svae_loss(key, model, obs_data, obs_data, model_params, **train_params)
     # Compute the prediction accuracy
     prior_params = model_params["prior_params"] 
     # Instead of this, we want to evaluate the expected log likelihood of the future observations
@@ -3397,34 +3465,6 @@ def svae_val_loss(key, model, data_batch, model_params, **train_params):
     post_params = out_dict["posterior_params"]
     horizon = train_params["prediction_horizon"] or 5
 
-    # def _prediction_lls(data_id, key):
-    #     num_windows = T-horizon-1
-    #     pred_lls = vmap(_sliding_window_prediction_lls, in_axes=(None, None, None, 0, 0))(
-    #         mu_filtered[data_id], Sigma_filtered[data_id], obs_data[data_id],
-    #         np.arange(num_windows), jr.split(key, num_windows))
-    #     return pred_lls.mean()
-
-    # # TODO: change this...!
-    # def _sliding_window_prediction_lls(mu, Sigma, data, t, key):
-    #     # Build the posterior object on the future latent states 
-    #     # ("the posterior predictive distribution")
-    #     # Convert unconstrained params to constrained dynamics parameters
-    #     prior_params_constrained = model.prior.get_dynamics_params(prior_params)
-    #     dynamics_params = {
-    #         "m1": mu[t],
-    #         "Q1": Sigma[t],
-    #         "A": prior_params_constrained["A"],
-    #         "b": prior_params_constrained["b"],
-    #         "Q": prior_params_constrained["Q"]
-    #     }
-    #     tridiag_params = dynamics_to_tridiag(dynamics_params, horizon+1, D) # Note the +1
-    #     J, L, h = tridiag_params["J"], tridiag_params["L"], tridiag_params["h"]
-    #     pred_posterior = MultivariateNormalBlockTridiag.infer(J, L, h)
-    #     # Sample from it and evaluate the log likelihood
-    #     x_pred = pred_posterior.sample(seed=key)[1:]
-    #     likelihood_dist = model.decoder.apply(model_params["dec_params"], x_pred)
-    #     return likelihood_dist.log_prob(
-    #         lax.dynamic_slice(data, (t+1, 0, 0, 0), (horizon,) + data.shape[1:])).sum(axis=(1, 2, 3))
     _, _, _, pred_lls = vmap(predict_multiple, in_axes=(None, None, None, 0, None, 0, None))\
         (train_params, model_params, model, obs_data, T-horizon, jr.split(key, N), 10)
     # pred_lls = vmap(_prediction_lls)(np.arange(N), jr.split(key, N))
@@ -3510,7 +3550,8 @@ def init_model(run_params, data_dict):
     if (p.get("use_natural_grad")):
         prior = LinearGaussianChainPrior(latent_dims, num_timesteps)
     else:
-        prior = LieParameterizedLinearGaussianChainPrior(latent_dims, num_timesteps)
+        prior = LieParameterizedLinearGaussianChainPrior(latent_dims, num_timesteps, 
+                    init_dynamics_noise_scale=p.get("init_dynamics_noise_scale") or 1)
 
     model = DeepLDS(
         recognition=rec_net,
@@ -3549,7 +3590,8 @@ def init_model(run_params, data_dict):
     else:
         initial_params = None
 
-    # emission_params = emission.init(seed_ems, np.ones((num_latent_dims,)))
+    svae_val_loss = svae_pendulum_val_loss if run_params["dataset"] == "pendulum" else svae_loss
+
     # Define the trainer object here
     trainer = Trainer(model, train_params=run_params, init=svae_init, 
                       loss=svae_loss, 
@@ -3635,7 +3677,7 @@ def sample_lds_dataset(run_params):
                               key=seed_sample)
     
     mll = vmap(lds.marginal_log_likelihood, in_axes=(None, 0))(params, data)
-    mll = np.mean(mll, axis=0)
+    mll = np.sum(mll) / data.size
     print("Data MLL: ", mll)
     
     seed_val, _ = jr.split(seed_sample)
@@ -4231,6 +4273,33 @@ def load_pendulum(run_params, log=False):
         "val_states": val_states,
     }
 
+def load_nlb(run_params, log=False):
+    d = run_params["dataset_params"]
+    train_trials = d["train_trials"]
+    val_trials = d["val_trials"]
+
+    train_data = np.load("nlb-for-yz/nlb-dsmc_maze-phase_trn-split_trn.p", allow_pickle=True)
+    val_data = np.load("nlb-for-yz/nlb-dsmc_maze-phase_trn-split_val.p", allow_pickle=True)
+
+    x_train = np.asarray(train_data.tensors[0], dtype=np.float32)
+    y_train = np.asarray(train_data.tensors[1], dtype=np.float32)
+    x_val = np.asarray(val_data.tensors[0], dtype=np.float32)
+    y_val = np.asarray(val_data.tensors[1], dtype=np.float32)
+
+    print("Full dataset:", x_train.shape, x_val.shape)
+
+    x_train, y_train = x_train[:train_trials], y_train[:train_trials]
+    x_val, y_val = x_val[:val_trials], y_val[:val_trials]
+
+    print("Subset:", x_train.shape, x_val.shape)
+
+    return {
+        "train_data": x_train,
+        "train_targets": y_train,
+        "val_data": x_val,
+        "val_targets": y_val,
+    }
+
 """# Run experiments!"""
 
 if ("data_dict" not in globals()): data_dict = {}
@@ -4243,7 +4312,7 @@ linear_recnet_architecture = {
     "head_mean_params": { "features": [] },
     "head_var_params": { "features": [] },
     "eps": 1e-4,
-    "cov_init": 2,
+    "cov_init": 1,
 }
 
 BiRNN_recnet_architecture = {
@@ -4253,6 +4322,28 @@ BiRNN_recnet_architecture = {
     "head_mean_params": { "features": [20, 20] },
     "head_var_params": { "features": [20, 20] },
     "head_dyn_params": { "features": [20,] },
+    "eps": 1e-4,
+    "cov_init": 1,
+}
+
+BiRNN_recnet_architecture_32 = {
+    "input_rank": 1,
+    "input_type": "MLP",
+    "input_params":{ "features": [64,] },
+    "head_mean_params": { "features": [64, 64] },
+    "head_var_params": { "features": [64, 64] },
+    "head_dyn_params": { "features": [64,] },
+    "eps": 1e-4,
+    "cov_init": 1,
+}
+
+BiRNN_recnet_architecture_64 = {
+    "input_rank": 1,
+    "input_type": "MLP",
+    "input_params":{ "features": [128,] },
+    "head_mean_params": { "features": [128, 128] },
+    "head_var_params": { "features": [128, 128] },
+    "head_dyn_params": { "features": [128,] },
     "eps": 1e-4,
     "cov_init": 1,
 }
@@ -4326,7 +4417,6 @@ CNN_conv_recnet_architecture = {
     "cov_init": 1,
 }
 
-
 CNN_BiRNN_recnet_architecture = {
     "input_rank": 3,
     "input_type": "CNN",
@@ -4372,14 +4462,26 @@ def get_lr(params, max_iters):
             prior_lr = opt.linear_schedule(0, prior_base_lr, .2 * max_iters, 0)
     return lr, prior_lr
 
+def get_beta_schedule(params, max_iters):
+    if params.get("beta_schedule"):
+        if params["beta_schedule"] == "linear_fast":
+            return opt.linear_schedule(0., 1., 1000, 0)
+        elif params["beta_schedule"] == "linear_slow":
+            return opt.linear_schedule(0., 1., 5000, 1000)
+        else:
+            print("Beta schedule undefined! Using constant instead.")
+            return lambda _: 1.0
+    else:
+        return lambda _: 1.0
+
 def expand_lds_parameters(params):
     num_timesteps = params.get("num_timesteps") or 200
     train_trials = { "small": 10, "medium": 100, "large": 1000 }
     batch_sizes = {"small": 10, "medium": 10, "large": 20 }
     emission_noises = { "small": 10., "medium": 1., "large": .1 }
     dynamics_noises = { "small": 0.01, "medium": .1, "large": .1 }
-    latent_dims = { "small": 3, "medium": 5, "large": 10 }
-    emission_dims = { "small": 5, "medium": 10, "large": 20 }
+    latent_dims = { "small": 3, "medium": 5, "large": 10, "32": 32, "64": 64}
+    emission_dims = { "small": 5, "medium": 10, "large": 20, "32": 64, "64": 128}
     max_iters = 20000
 
     # Modify all the architectures according to the parameters given
@@ -4390,9 +4492,17 @@ def expand_lds_parameters(params):
         inf_params["recnet_class"] = "GaussianRecognition"
         architecture = deepcopy(linear_recnet_architecture)
         architecture["output_dim"] = D
+        architecture["diagonal_covariance"] = True if params.get("diagonal_covariance") else False
     elif (params["inference_method"] in ["dkf", "cdkf"]):
         inf_params["recnet_class"] = "GaussianBiRNN"
-        architecture = deepcopy(BiRNN_recnet_architecture)
+        architectures = {
+            "small": BiRNN_recnet_architecture,
+            "medium": BiRNN_recnet_architecture,
+            "large": BiRNN_recnet_architecture,
+            "32": BiRNN_recnet_architecture_32,
+            "64": BiRNN_recnet_architecture_64,
+        }
+        architecture = deepcopy(architectures[params["dimensionality"]])
         architecture["output_dim"] = D
         architecture["rnn_dim"] = H
     elif (params["inference_method"] == "planet"):
@@ -4410,11 +4520,11 @@ def expand_lds_parameters(params):
         post_arch["output_dim"] = D
         inf_params["posterior_architecture"] = post_arch
         inf_params["sample_kl"] = True # PlaNet doesn't have built-in suff-stats
-    elif (params["inference_method"] in ["conv"]):  
-        inf_params["recnet_class"] = "TemporalConv" 
-        architecture = deepcopy(conv_recnet_architecture)   
-        architecture["output_dim"] = D  
-        # The output heads will output distributions in D dimensional space 
+    elif (params["inference_method"] in ["conv"]):
+        inf_params["recnet_class"] = "TemporalConv"
+        architecture = deepcopy(conv_recnet_architecture)
+        architecture["output_dim"] = D
+        # The output heads will output distributions in D dimensional space
         architecture["cnn_params"]["output_dim"] = H
 
         # Change the convolution kernel size
@@ -4436,7 +4546,7 @@ def expand_lds_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-LDS-ICML-1",
+        "project_name": "SVAE-LDS-ICML-RE-1",
         "log_to_wandb": True,
         "dataset": "lds",
         # We're just doing model learning since we're lazy
@@ -4461,6 +4571,7 @@ def expand_lds_parameters(params):
         "plot_interval": 100,
         "learning_rate": lr, 
         "prior_learning_rate": prior_lr,
+        "use_validation": True,
         # Note that we do not specify this in the high-level parameters!
         "latent_dims": D
     }
@@ -4524,7 +4635,7 @@ def expand_pendulum_parameters(params):
     else:
         print("Inference method not found: " + params["inference_method"])
         assert(False)
-        
+
     decnet_architecture = deepcopy(DCNN_decnet_architecture)
 
     if (params.get("learn_output_covariance")):
@@ -4533,7 +4644,7 @@ def expand_pendulum_parameters(params):
         decnet_class = "GaussianDCNNEmissionFixedCovariance"
         # Use the known data variance
         decnet_architecture["output_noise_scale"] = noise_scales[params["snr"]] ** 0.5
-            
+
     inf_params["recnet_architecture"] = architecture
     lr, prior_lr = get_lr(params, max_iters)
 
@@ -4574,6 +4685,100 @@ def expand_pendulum_parameters(params):
     extended_params.update(params)
     return extended_params
 
+def expand_nlb_parameters(params):
+    train_trials = { "small": 20, "medium": 100, "large": 1720 }
+    batch_sizes = {"small": 10, "medium": 10, "large": 10 }
+    # Not a very good validation split (mostly because we're doing one full batch for val)
+    val_trials = { "small": 4, "medium": 20, "large": 570 }
+    max_iters = 20000
+
+    # Modify all the architectures according to the parameters given
+    D = params["latent_dims"]
+    H = D * 2 # Set rnn dims to twice the latent dims for enough capacity
+    N = 45 # Number of output neurons
+
+    inf_params = {}
+    input_architecture = { "features": [128, 128, 64, 64] }
+
+    if (params["inference_method"] == "svae"):
+        inf_params["recnet_class"] = "GaussianRecognition"
+        architecture = {
+            "diagonal_covariance": True,
+            "input_rank": 1,
+            "trunk_type": "MLP",
+            "trunk_params": input_architecture,
+            "head_mean_params": { "features": [64] },
+            "head_var_params": { "features": [64] },
+            "eps": 1e-4,
+            "cov_init": 1,
+        }
+        architecture["output_dim"] = D
+    elif (params["inference_method"] in ["dkf", "cdkf"]):
+        inf_params["recnet_class"] = "GaussianBiRNN"
+        architecture = {
+            "diagonal_covariance": True,
+            "input_rank": 1,
+            "input_type": "MLP",
+            "input_params": input_architecture,
+            "head_mean_params": { "features": [64,] },
+            "head_var_params": { "features": [64,] },
+            "head_dyn_params": { "features": [64,] },
+            "eps": 1e-4,
+            "cov_init": 1,
+        }
+        architecture["output_dim"] = D
+        architecture["rnn_dim"] = H
+    else:
+        print("Inference method not found: " + params["inference_method"])
+        assert(False)
+    
+    # Fix the decoder architecture
+    decnet_architecture = {
+        "diagonal_covariance": True,
+        "input_rank": 1,
+        "head_mean_params": { "features": [64, 64, 64] },
+        "head_var_params": { "features": [] },
+        "output_dim": N,
+        "eps": 1e-6,
+        "cov_init": 1,
+    }
+
+    inf_params["recnet_architecture"] = copy.deepcopy(architecture)
+    lr, prior_lr = get_lr(params, max_iters)
+
+    extended_params = {
+        "project_name": "SVAE-NLB-Test",
+        "log_to_wandb": True,
+        "dataset": "nlb",
+        # Must be model learning
+        "run_type": "model_learning",
+        "decnet_class": "PoissonEmissions",
+        "decnet_architecture": decnet_architecture,
+        "dataset_params": {
+            "train_trials": train_trials[params["dataset_size"]],
+            "val_trials": val_trials[params["dataset_size"]],
+        },
+        # Implementation choice
+        "use_parallel_kf": False,
+        # Training specifics
+        "max_iters": max_iters,
+        "elbo_samples": 1,
+        "sample_kl": True,
+        "batch_size": batch_sizes[params["dataset_size"]],
+        "record_params": lambda i: i % 1000 == 0,
+        "plot_interval": 200,
+        "learning_rate": lr, 
+        "prior_learning_rate": prior_lr,
+        "use_validation": True,
+        "constrain_dynamics": True,
+        "beta": get_beta_schedule(params, max_iters),
+        "init_dynamics_noise_scale": 1e-4
+    }
+    extended_params.update(inf_params)
+    # This allows us to override ANY of the above...!
+    extended_params.update(params)
+    return extended_params
+
 def run_lds(run_params, run_variations=None):
     jax.config.update("jax_debug_nans", True)
     results = experiment_scheduler(run_params, 
@@ -4594,6 +4799,18 @@ def run_pendulum(run_params, run_variations=None):
                      model_getter=init_model, 
                      train_func=start_trainer,
                      params_expander=expand_pendulum_parameters,
+                     on_error=on_error)
+    wandb.finish()
+    return results
+
+def run_nlb(run_params, run_variations=None):
+    jax.config.update("jax_debug_nans", True)
+    results = experiment_scheduler(run_params, 
+                     run_variations=run_variations,
+                     dataset_getter=load_nlb, 
+                     model_getter=init_model, 
+                     train_func=start_trainer,
+                     params_expander=expand_nlb_parameters,
                      on_error=on_error)
     wandb.finish()
     return results
