@@ -3432,7 +3432,7 @@ def svae_loss(key, model, data_batch, target_batch, model_params, itr=0, **train
         expected_post_suff_stats = tree_map(
             lambda l: np.mean(l,axis=0), post_suff_stats)
         result["sufficient_statistics"] = expected_post_suff_stats
-    
+
     # objs = result["objective"]
     if (train_params.get("beta") is None):
         beta = 1
@@ -4444,8 +4444,8 @@ DCNN_decnet_architecture = {
 def get_lr(params, max_iters):
     base_lr = params["base_lr"]
     prior_base_lr = params["prior_base_lr"]
-    lr = base_lr
-    prior_lr = prior_base_lr
+    lr = opt.constant_schedule(base_lr)
+    prior_lr = opt.constant_schedule(prior_base_lr)
     pprint(params)
     if params["lr_decay"]:
         print("Using learning rate decay!")
@@ -4457,9 +4457,12 @@ def get_lr(params, max_iters):
         if params["prior_lr_warmup"]:
             prior_lr = opt.cosine_onecycle_schedule(max_iters, prior_base_lr, 0.5)
     else:
-        lr = base_lr
         if params["prior_lr_warmup"]: 
             prior_lr = opt.linear_schedule(0, prior_base_lr, .2 * max_iters, 0)
+    # Always use learning rate warm-up for stability in initial training
+    warmup_end = 200
+    lr_warmup = opt.linear_schedule(0, base_lr, warmup_end, 0)
+    lr = opt.join_schedules([lr_warmup, lr], [warmup_end])
     return lr, prior_lr
 
 def get_beta_schedule(params, max_iters):
@@ -4573,7 +4576,8 @@ def expand_lds_parameters(params):
         "prior_learning_rate": prior_lr,
         "use_validation": True,
         # Note that we do not specify this in the high-level parameters!
-        "latent_dims": D
+        "latent_dims": D,
+        "lr_warmup": True
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
@@ -4679,6 +4683,7 @@ def expand_pendulum_parameters(params):
         # Pendulum specific
         "prediction_horizon": 5,
         "learn_output_covariance": False,
+        "lr_warmup": True
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
@@ -4747,7 +4752,7 @@ def expand_nlb_parameters(params):
     lr, prior_lr = get_lr(params, max_iters)
 
     extended_params = {
-        "project_name": "SVAE-NLB-Test",
+        "project_name": "SVAE-NLB-ICML-1",
         "log_to_wandb": True,
         "dataset": "nlb",
         # Must be model learning
@@ -4772,7 +4777,8 @@ def expand_nlb_parameters(params):
         "use_validation": True,
         "constrain_dynamics": True,
         "beta": get_beta_schedule(params, max_iters),
-        "init_dynamics_noise_scale": 1e-4
+        "init_dynamics_noise_scale": 1e-4,
+        "lr_warmup": True
     }
     extended_params.update(inf_params)
     # This allows us to override ANY of the above...!
