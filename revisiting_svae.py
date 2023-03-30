@@ -3236,7 +3236,7 @@ def log_to_wandb(trainer, loss_out, data_dict, grads):
 def save_params_to_wandb(trainer, data_dict):
     file_name = "parameters.pkl"
     with open(file_name, "wb") as f:
-        pkl.dump(trainer.past_params, f)
+        pkl.dump(trainer.params, f)
         wandb.save(file_name, policy="now")
 
 def on_error(data_dict, model_dict):
@@ -3395,6 +3395,10 @@ def svae_init(key, model, data, initial_params=None, **train_params):
     init_params["post_samples"] = np.zeros((data.shape[0], 
                                             train_params.get("obj_samples") or 1) 
                                              + model.posterior.shape)
+    # If we are in VAE mode, set the dynamics matrix to be 0
+    if (train_params.get("run_type") == "vae_baseline"):
+        A = init_params["prior_params"]["A"]
+        init_params["prior_params"]["A"] = np.zeros_like(A)
 
     learning_rate = train_params["learning_rate"]
     rec_opt = opt.adam(learning_rate=learning_rate)
@@ -3505,10 +3509,15 @@ def svae_update(params, grads, opts, opt_states, model, aux, **train_params):
             # Revert Q and b to their previous values
             params["prior_params"]["Q"] = old_Q
             params["prior_params"]["b"] = old_b
-
+    
+    A = params["prior_params"]["A"]
+    if (train_params.get("run_type") == "vae_baseline"):
+        # Zero out the updated dynamics matrix
+        params["prior_params"]["A"] = np.zeros_like(A)
+    else:
         if (train_params.get("constrain_dynamics")):
             # Scale A so that its maximum singular value does not exceed 1
-            params["prior_params"]["A"] = truncate_singular_values(params["prior_params"]["A"])
+            params["prior_params"]["A"] = truncate_singular_values(A)
             # params["prior_params"]["A"] = scale_singular_values(params["prior_params"]["A"])
 
     return params, (rec_opt_state, dec_opt_state, prior_opt_state)
@@ -3672,9 +3681,10 @@ def sample_lds_dataset(run_params):
                                 "ExxT": constrained["ExxT"], 
                                 "ExnxT": constrained["ExnxT"] }
 
-    states, data = lds.sample(params, 
-                              shape=(num_trials,), 
-                              key=seed_sample)
+    # states, data = lds.sample(params, 
+    #                           shape=(num_trials,), 
+    #                           key=seed_sample)
+    states, data = vmap(lambda key: lds.sample(params, shape=(), key=key))(jr.split(seed_sample, num_trials))
     
     mll = vmap(lds.marginal_log_likelihood, in_axes=(None, 0))(params, data)
     mll = np.sum(mll) / data.size
@@ -4300,6 +4310,9 @@ def load_nlb(run_params, log=False):
         "val_targets": y_val,
     }
 
+def load_lds_64d(run_params, log=False):
+	return np.load("lds_64d/dataset_large.npy", allow_pickle=True).item()
+
 """# Run experiments!"""
 
 if ("data_dict" not in globals()): data_dict = {}
@@ -4480,7 +4493,7 @@ def get_beta_schedule(params, max_iters):
 def expand_lds_parameters(params):
     num_timesteps = params.get("num_timesteps") or 200
     train_trials = { "small": 10, "medium": 100, "large": 1000 }
-    batch_sizes = {"small": 10, "medium": 10, "large": 20 }
+    batch_sizes = {"small": 10, "medium": 10, "large": 10 }
     emission_noises = { "small": 10., "medium": 1., "large": .1 }
     dynamics_noises = { "small": 0.01, "medium": .1, "large": .1 }
     latent_dims = { "small": 3, "medium": 5, "large": 10, "32": 32, "64": 64}
@@ -4737,11 +4750,19 @@ def expand_nlb_parameters(params):
         print("Inference method not found: " + params["inference_method"])
         assert(False)
     
+    if (params["run_type"] == "lds_baseline"):
+        architecture = deepcopy(linear_recnet_architecture)
+        architecture["output_dim"] = D
+        architecture["diagonal_covariance"] = True if params.get("diagonal_covariance") else False
+        dec_features = []
+    else:
+        dec_features = [64, 64, 64]
+
     # Fix the decoder architecture
     decnet_architecture = {
         "diagonal_covariance": True,
         "input_rank": 1,
-        "head_mean_params": { "features": [64, 64, 64] },
+        "head_mean_params": { "features": dec_features },
         "head_var_params": { "features": [] },
         "output_dim": N,
         "eps": 1e-6,
@@ -4787,9 +4808,17 @@ def expand_nlb_parameters(params):
 
 def run_lds(run_params, run_variations=None):
     jax.config.update("jax_debug_nans", True)
+
+    if (run_params["dimensionality"] == "64"
+    and run_params["dataset_size"] == "large"):
+        load_lds = load_lds_64d
+        print("Loading pre-sampled data")
+    else:
+        load_lds = sample_lds_dataset
+
     results = experiment_scheduler(run_params, 
                      run_variations=run_variations,
-                     dataset_getter=sample_lds_dataset, 
+                     dataset_getter=load_lds, 
                      model_getter=init_model, 
                      train_func=start_trainer,
                      params_expander=expand_lds_parameters,

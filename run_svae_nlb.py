@@ -11,6 +11,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--inference_method', type=str)
+    parser.add_argument('--run_type', type=str)
 
     parser.add_argument('--latent_dims', type=int)
     parser.add_argument('--seed', type=int)
