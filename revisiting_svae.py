@@ -1223,8 +1223,9 @@ class LieParameterizedLinearGaussianChainPrior(LinearGaussianChainPrior):
         D = self.latent_dims
         key_A, key = jr.split(key, 2)
         # Equivalent to the unit matrix
+        eps = min(self.init_dynamics_noise_scale / 100, 1e-4)
         Q_flat = np.concatenate([np.ones(D) 
-            * inv_softplus(self.init_dynamics_noise_scale), np.zeros((D*(D-1)//2))])
+            * inv_softplus(self.init_dynamics_noise_scale, eps=eps), np.zeros((D*(D-1)//2))])
         Q1_flat = np.concatenate([np.ones(D) * inv_softplus(1), np.zeros((D*(D-1)//2))])
         params = {
             "m1": np.zeros(D),
